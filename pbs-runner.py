@@ -526,7 +526,7 @@ class PxarEntry:
         cleanup_unmounts: Optional[List[Path]] = None,
         cleanup_union_root: Optional[Path] = None,
         destroy_snapshot_spec: Optional[Tuple[str, str, bool]] = None,
-        archive_type: str = "pxar"  # pxar, img.fidx, blob
+        archive_type: str = "pxar"  # pxar, img, conf, log
     ):
         self.label = label
         self.src_path = src_path
@@ -1018,14 +1018,14 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
             note=f"VM {vm_name} disk {target_dev} ({source_path})" + (" [LIVE]" if is_using_live else ""),
             snapshot_required=False,
             warned=is_using_live,
-            archive_type="img.fidx",  # Disk images use .img.fidx format
+            archive_type="img",  # Disk images use .img type (PBS creates .img.fidx on server)
         )
         entries.append(entry)
 
     # === Add VM config file ===
     if config_file and config_file.exists():
         config_entry = PxarEntry(
-            label="qemu-server.conf",  # Standard PBS VM config name
+            label="qemu-server",  # PBS will create qemu-server.conf.blob on server
             src_path=config_file,
             repositories=repositories,
             namespace=base_namespace,
@@ -1033,7 +1033,7 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
             note=f"VM {vm_name} configuration",
             snapshot_required=False,
             warned=False,
-            archive_type="blob",  # Config files use .blob format
+            archive_type="conf",  # Config files use .conf type (PBS creates .conf.blob on server)
         )
         entries.append(config_entry)
     else:
