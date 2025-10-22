@@ -1,0 +1,132 @@
+# config.example.yaml
+
+# pbs-runner — example configuration
+# Copy to config.yaml and tailor to your environment.
+# This example includes all options (many commented out) for reference.
+
+# -------------------------
+# PBS repositories (env injected per command; no wrapper needed)
+# -------------------------
+repositories:
+  # Define each PBS repo once and reference by its alias in folders.
+  my_repo:
+    repository: "user@pbs@pbs.example.com:datastore1"   # exported as PBS_REPOSITORY
+    password:   "supersecret"                   # exported as PBS_PASSWORD
+    fingerprint: "aa:bb:cc:dd:ee:ff:..."        # exported as PBS_FINGERPRINT 
+
+  # cloud:
+  #   repository: "user@pbs@cloud-pbs.example.com:datastore"
+  #   password:   "anothersecret"
+  #   fingerprint: ""
+
+# -------------------------
+# Global defaults (overridable at section and folder levels)
+# -------------------------
+defaults:
+  # ZFS snapshotting:
+  snapshot: false                 # create ZFS snapshots and back up from snapshot paths
+  split_subfolders: false         # split folder into immediate subfolders as individual items
+  fallback_to_live: true          # if snapshotting fails/unavailable, back up live paths (warn)
+  skip_hidden_subfolders: true    # ignore subfolders that start with '.' when splitting
+
+  # Grouping of backups into PBS snapshots:
+  # - bundle        : items sharing (repo, ns, backup-id) are bundled into one command
+  # - per-app-id    : each item uses its own --backup-id (from backup_id_template)
+  # - per-namespace : each item uses its own --ns (from namespace_template; namespaces must exist)
+  backup_grouping: "bundle"
+  backup_id_template: "{host}-{name}"     # tokens: {host}, {name}, {section}, {YYYY}, {MM}, {DD}
+  namespace: ""                           # base namespace for items ('' => root)
+  namespace_template: "{host}/{name}"       # used when backup_grouping=per-namespace
+
+  # Union mode (bind-mounted unified snapshot view)
+  # When snapshot=true AND split_subfolders=false:
+  # - auto : build a temp union (bind) of parent snapshot + child dataset snapshots, then back up one pxar
+  # - off  : disable union; parent snapshot will not include child dataset content (ZFS behavior)
+  union_mode: "auto"
+  union_mount_root: "/tmp"                # base directory where a unique mktemp-like dir will be created
+
+  # Extra proxmox-backup-client options to append (be careful with quoting):
+  # Example: ["--verbose"] or ["--rate", "50MB"]
+  extra_args: []
+
+  # Path to proxmox-backup-client binary
+  pbc_binary: "/usr/local/bin/proxmox-backup-client"
+
+  # Logging (console + rotating file)
+  log:
+    file: "/var/log/pbs-runner.log"                # consider an absolute path (e.g., /var/log/pbs_runner/pbs_runner.log)
+    level: "INFO"
+    rotate_max_bytes: 10485760            # 10 MiB
+    rotate_backups: 5
+
+# -------------------------
+# Notifications (optional)
+# -------------------------
+notifications:
+  healthcheck_url: ""                     # Healthchecks.io endpoint; pings /start, /fail, and success baseline
+  discord_webhook: ""                     # Discord webhook URL
+  discord_notify_on: ["failure", "fallback"]  # any of: start, success, failure, finish, fallback
+  discord_prefix: "[pbs-runner]"          # prefix for Discord messages
+
+# -------------------------
+# Section: host
+# -------------------------
+host:
+  # Backup group identity for this section (unless overridden by per-app-id mode)
+  backup_id: "my_host"
+  backup_type: "host"
+
+  # Section-level overrides (inherit from defaults otherwise)
+  snapshot: true
+  split_subfolders: false
+  fallback_to_live: true
+  # namespace: ""                         # section-level namespace ('' => root)
+  # backup_grouping: "bundle"             # override grouping here if desired
+  # union_mode: "auto"                    # override per section
+  # union_mount_root: "/tmp"              # override per section
+
+  folders:
+    # 1) Simple folder — no snapshot
+    - path: "/boot"
+      snapshot: false
+      split_subfolders: false
+      label: "boot"
+      repositories: ["my_repo"]
+
+    # 2) Appdata — single pxar using union mode (snapshot=true, split=false)
+    - path: "/mnt/cache/appdata"
+      snapshot: true
+      split_subfolders: false             # union mode kicks in (since snapshot=true)
+      # union_mode: "auto"                # optional override per folder
+      # union_mount_root: "/tmp"          # optional override per folder
+      backup_grouping: "bundle"           # one pxar, grouped with other items if same (repo, ns, bid)
+      repositories: ["my_repo"]
+
+    # 3) Appdata — per-app retention using split + per-app-id
+    # - Each immediate subfolder becomes its own item and its own PBS group
+    # - Good when you want separate retention for each app
+    # - Note: union mode does NOT apply when splitting.
+    # - Example is commented out; uncomment to use.
+    # - path: "/mnt/nvme/appdata"
+    #   snapshot: true
+    #   split_subfolders: true
+    #   backup_grouping: "per-app-id"
+    #   backup_id_template: "{host}-{name}"    # e.g., my_host-plex, my_host-sonarr
+    #   # label_prefix: "appdata"               # optional cosmetic prefix for pxar labels
+    #   repositories: ["my_host"]
+
+# -------------------------
+# Section: vm (reserved for future)
+# -------------------------
+vm:
+  backup_id: "my_host-vm"
+  backup_type: "vm"
+  # folders: []
+
+# -------------------------
+# Section: ct (reserved for future)
+# -------------------------
+ct:
+  backup_id: "my_host-ct"
+  backup_type: "ct"
+  # folders: []
