@@ -116,12 +116,90 @@ host:
     #   repositories: ["my_host"]
 
 # -------------------------
-# Section: vm (reserved for future)
+# Section: vm
 # -------------------------
 vm:
-  backup_id: "my_host-vm"
-  backup_type: "vm"
-  # folders: []
+  # VM backups use libvirt auto-discovery to find VMs
+  # Each VM is backed up as a separate PBS backup-id using the VM name
+  backup_type: "vm"                   # REQUIRED: must be "vm" for VM backups
+
+  # Section-level defaults for all VMs
+  snapshot: true                      # Create ZFS snapshots of VM disks before backup
+  fallback_to_live: true              # If snapshot fails, backup live disks (with warning)
+  check_vm_state: true                # Check if VM is running via virsh
+  warn_if_running: true               # Warn if VM is running but continue backup
+
+  # libvirt-specific settings
+  libvirt:
+    virsh_uri: "qemu:///system"       # libvirt connection URI
+    config_path: /etc/libvirt/qemu    # Where VM XML configs are stored
+
+  # Auto-discovery of VMs from libvirt
+  auto_discover:
+    enabled: true                     # Enable auto-discovery
+    config_path: /etc/libvirt/qemu    # Override libvirt config path if needed
+    repositories:
+      - my_repo                       # PBS repository to backup to
+
+    # Optional: namespace for VM backups (supports template variables)
+    # Examples:
+    #   namespace: "vms"              # All VMs in /vms namespace
+    #   namespace: "{host}/vms"       # /hostname/vms namespace
+    #   namespace: "vms/{vm}"         # /vms/vm-name namespace
+    # namespace: "vms"
+
+    # Optional: filters for VM discovery
+    # exclude_vms:                    # Exclude VMs matching these patterns (glob)
+    #   - "test-*"                    # Exclude all VMs starting with "test-"
+    #   - "temp-vm"                   # Exclude specific VM
+    # include_only:                   # Only include VMs matching these patterns
+    #   - "prod-*"                    # Only backup VMs starting with "prod-"
+
+  # -------------------------
+  # Unraid-specific example (commented out)
+  # -------------------------
+  # For Unraid systems, the config is identical since Unraid uses libvirt
+  # Unraid stores VM configs in /etc/libvirt/qemu by default
+  # Unraid stores VM disks in /mnt/user/domains/<vm-name>/ by default
+  #
+  # Example for Unraid:
+  # auto_discover:
+  #   enabled: true
+  #   config_path: /etc/libvirt/qemu  # Default Unraid location
+  #   repositories:
+  #     - my_repo
+  #   namespace: "{host}/vms"
+  #   exclude_vms:
+  #     - "Windows*"                  # Example: skip Windows VMs
+
+  # -------------------------
+  # How VM backups work:
+  # -------------------------
+  # 1. Scans /etc/libvirt/qemu for *.xml files
+  # 2. Parses each XML to extract VM name and disk paths
+  # 3. For each disk:
+  #    - If file (qcow2/raw): finds parent ZFS dataset and snapshots it
+  #    - If zvol (/dev/zvol/...): snapshots the zvol directly
+  # 4. Backs up each disk from snapshot + VM config XML
+  # 5. Uses VM name as --backup-id (not numeric VMID)
+  # 6. Cleans up snapshots after backup completes
+  #
+  # Example PBS backup structure:
+  #   vm/<backup-id>/<timestamp>/
+  #     vdisk1.pxar       (VM disk 1)
+  #     vdisk2.pxar       (VM disk 2)
+  #     vm-config.pxar    (VM XML config)
+
+  # -------------------------
+  # Manual VM configuration (future feature - not yet implemented)
+  # -------------------------
+  # manual_vms:
+  #   - name: special-vm
+  #     vm_name: "special-vm"           # Name in virsh
+  #     path: /custom/vm/location
+  #     config_file: /custom/vm.xml
+  #     repositories:
+  #       - my_repo
 
 # -------------------------
 # Section: ct (reserved for future)

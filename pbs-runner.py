@@ -37,6 +37,12 @@ except Exception:
     print("Missing dependency: pyyaml. Install with: pip install pyyaml", file=sys.stderr)
     sys.exit(2)
 
+try:
+    import xml.etree.ElementTree as ET
+except Exception:
+    print("Missing dependency: xml. This should be part of Python standard library.", file=sys.stderr)
+    sys.exit(2)
+
 # =========================
 # Shell & small utilities
 # =========================
@@ -123,12 +129,13 @@ def dedupe_labels(labels: List[str]) -> List[str]:
 # Templating helpers
 # =========================
 
-def expand_template(tpl: str, *, name: str, section: str, host: str) -> str:
+def expand_template(tpl: str, *, name: str = "", section: str = "", host: str = "", vm: str = "") -> str:
     now = dt.datetime.now()
     repl = {
         "name": name,
         "section": section,
         "host": host,
+        "vm": vm,  # VM name for vm: section backups
         "YYYY": f"{now.year:04d}",
         "MM": f"{now.month:02d}",
         "DD": f"{now.day:02d}",
@@ -323,6 +330,181 @@ def umount_path(p: Path, dry=False) -> int:
     if rc != 0:
         rc, _, _ = sh(["umount", "-l", str(p)], capture=True)
     return rc
+
+# =========================
+# VM / libvirt helpers
+# =========================
+
+def virsh_available() -> bool:
+    """Check if virsh command is available."""
+    return sh(["bash", "-lc", "command -v virsh >/dev/null 2>&1"], capture=True)[0] == 0
+
+def get_vm_state(vm_name: str, virsh_uri: str = "qemu:///system") -> str:
+    """
+    Get VM state via virsh.
+    Returns: 'running', 'shut off', 'paused', or 'unknown'
+    """
+    if not virsh_available():
+        return "unknown"
+
+    rc, out, _ = sh(["virsh", "-c", virsh_uri, "domstate", vm_name], capture=True)
+    if rc == 0:
+        state = out.strip().lower()
+        return state
+    return "unknown"
+
+def parse_disk_element(disk_elem):
+    """
+    Parse a libvirt <disk> element and extract source path and metadata.
+
+    Examples:
+    <disk type='file' device='disk'>
+      <source file='/mnt/user/domains/vm1/vdisk1.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+      <driver name='qemu' type='qcow2'/>
+    </disk>
+
+    <disk type='block' device='disk'>
+      <source dev='/dev/zvol/tank/vms/vm1/disk0'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+
+    Returns dict with disk info or None if not a valid disk
+    """
+    disk_device = disk_elem.get('device', 'disk')
+    if disk_device != 'disk':
+        # Skip cdrom, floppy, etc.
+        return None
+
+    disk_type = disk_elem.get('type')  # 'file' or 'block'
+
+    source_elem = disk_elem.find('source')
+    if source_elem is None:
+        return None
+
+    # Get source path
+    source_path = None
+    if disk_type == 'file':
+        source_path = source_elem.get('file')
+    elif disk_type == 'block':
+        source_path = source_elem.get('dev')
+
+    if not source_path:
+        return None
+
+    # Get target device name
+    target_elem = disk_elem.find('target')
+    target_dev = target_elem.get('dev') if target_elem is not None else 'unknown'
+
+    # Get driver type (qcow2, raw, etc.)
+    driver_elem = disk_elem.find('driver')
+    driver_type = driver_elem.get('type') if driver_elem is not None else 'raw'
+
+    return {
+        'source_path': Path(source_path),
+        'disk_type': disk_type,      # 'file' or 'block'
+        'target_dev': target_dev,    # 'vda', 'vdb', etc.
+        'format': driver_type,       # 'qcow2', 'raw', etc.
+    }
+
+def parse_vm_xml(xml_file: Path) -> Optional[dict]:
+    """
+    Parse libvirt VM XML and extract VM name and disk information.
+    Returns dict with VM details or None if parsing fails.
+    """
+    try:
+        tree = ET.parse(str(xml_file))
+        root = tree.getroot()
+
+        # Extract VM name
+        name_elem = root.find('name')
+        if name_elem is None or not name_elem.text:
+            logging.warning("No <name> in %s, skipping", xml_file)
+            return None
+
+        vm_name = name_elem.text.strip()
+
+        # Extract all disk sources
+        disks = []
+        for disk_elem in root.findall('.//devices/disk'):
+            disk_info = parse_disk_element(disk_elem)
+            if disk_info:
+                disks.append(disk_info)
+
+        if not disks:
+            logging.debug("VM %s has no disks, skipping", vm_name)
+            return None
+
+        return {
+            'name': vm_name,
+            'config_file': xml_file,
+            'disks': disks,
+        }
+    except Exception as e:
+        logging.warning("Failed to parse %s: %s", xml_file, e)
+        return None
+
+def should_exclude_vm(vm_name: str, filters: dict) -> bool:
+    """
+    Check if VM should be excluded based on include_only/exclude_vms filters.
+    """
+    import fnmatch
+
+    exclude = filters.get('exclude_vms', [])
+    include = filters.get('include_only', [])
+
+    # If include_only specified, must match at least one pattern
+    if include:
+        if not any(fnmatch.fnmatch(vm_name, pattern) for pattern in include):
+            logging.debug("VM %s excluded (not in include_only)", vm_name)
+            return True
+
+    # Check exclusions
+    if any(fnmatch.fnmatch(vm_name, pattern) for pattern in exclude):
+        logging.debug("VM %s excluded (matches exclude pattern)", vm_name)
+        return True
+
+    return False
+
+def extract_zvol_dataset(zvol_path: Path) -> Optional[str]:
+    """
+    Extract dataset name from zvol device path.
+    /dev/zvol/tank/vms/vm1/disk0 -> tank/vms/vm1/disk0
+    """
+    path_str = str(zvol_path)
+    if '/dev/zvol/' in path_str:
+        return path_str.replace('/dev/zvol/', '')
+    return None
+
+def discover_vms_from_libvirt(auto_discover_cfg: dict, section_defaults: dict) -> List[dict]:
+    """
+    Scan libvirt config directory and parse VM XMLs.
+    Returns list of VM entries ready for backup planning.
+    """
+    config_path = auto_discover_cfg.get('config_path', '/etc/libvirt/qemu')
+    config_dir = Path(config_path)
+
+    if not config_dir.exists() or not config_dir.is_dir():
+        logging.warning("libvirt config path %s not found or not a directory, skipping auto-discovery", config_dir)
+        return []
+
+    vm_entries = []
+    repositories = auto_discover_cfg.get('repositories', [])
+
+    if not repositories:
+        logging.warning("No repositories specified in auto_discover, VMs will be skipped")
+        return []
+
+    for xml_file in sorted(config_dir.glob("*.xml")):
+        vm_data = parse_vm_xml(xml_file)
+
+        if vm_data and not should_exclude_vm(vm_data['name'], auto_discover_cfg):
+            vm_data['repositories'] = repositories
+            vm_data['namespace'] = auto_discover_cfg.get('namespace')
+            vm_entries.append(vm_data)
+            logging.info("Discovered VM: %s with %d disk(s)", vm_data['name'], len(vm_data['disks']))
+
+    return vm_entries
 
 # =========================
 # Planning model
@@ -646,6 +828,215 @@ def plan_for_folder(folder_cfg, section_defaults, global_defaults, *, dry_run=Fa
 
     return entries, created_snaps, warnings
 
+def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict,
+                   dry_run=False, section_name="vm") -> Tuple[List[PxarEntry], List[Tuple[str, str, bool]], List[str]]:
+    """
+    Plan backup for a single VM.
+
+    Strategy:
+    1. For each disk, determine if it's file-based or zvol
+    2. For file disks: find parent ZFS dataset and snapshot it
+    3. For zvol disks: snapshot the zvol directly
+    4. Build snapshot paths for each disk
+    5. Fallback to live if snapshot fails and fallback_to_live=true
+    6. Return PxarEntry list (one per disk + one for config)
+
+    Returns: (entries, snapshots_created, warnings)
+        snapshots_created: [(dataset, tag, recursive), ...]
+    """
+    eff = dict(global_defaults or {})
+    eff.update(section_defaults or {})
+
+    snapshot = bool(eff.get("snapshot", False))
+    fallback = bool(eff.get("fallback_to_live", True))
+    check_state = bool(eff.get("check_vm_state", True))
+    warn_if_running = bool(eff.get("warn_if_running", True))
+
+    vm_name = vm_entry['name']
+    config_file = vm_entry['config_file']
+    disks = vm_entry['disks']
+    repositories = vm_entry['repositories']
+    base_namespace = vm_entry.get('namespace')
+
+    if not repositories:
+        logging.info("VM %s has no repositories, skipping", vm_name)
+        return [], [], []
+
+    warnings = []
+    entries = []
+    snapshots_created = []  # Track (dataset, tag, recursive) for cleanup
+
+    # Check VM state
+    if check_state:
+        virsh_uri = eff.get('libvirt', {}).get('virsh_uri', 'qemu:///system')
+        state = get_vm_state(vm_name, virsh_uri)
+        if state == 'running' and warn_if_running:
+            logging.warning("VM %s is currently running - backing up live VM", vm_name)
+        elif state != 'unknown':
+            logging.info("VM %s state: %s", vm_name, state)
+
+    # Build snapshot tag
+    tag = build_snapshot_tag(f"{section_name}-{vm_name}")
+    zfs_ok = zfs_available()
+
+    # === Strategy: Handle each disk independently, snapshot as needed ===
+    disk_to_snapshot_path = {}  # Maps original disk path -> snapshot path
+    dataset_snapshots = {}      # Track which datasets/zvols we've snapshotted
+
+    for disk_info in disks:
+        source_path = disk_info['source_path']
+        disk_type = disk_info['disk_type']
+
+        # Check if source path exists
+        if not source_path.exists():
+            msg = f"VM {vm_name}: disk {source_path} does not exist"
+            logging.error(msg)
+            if not fallback:
+                warnings.append(msg)
+                continue
+
+        if snapshot and zfs_ok:
+            if disk_type == 'block' and '/dev/zvol/' in str(source_path):
+                # It's a zvol: /dev/zvol/tank/vms/vm1/disk0
+                zvol_ds = extract_zvol_dataset(source_path)
+                if zvol_ds:
+                    # Snapshot the zvol itself
+                    if zvol_ds not in dataset_snapshots:
+                        if dry_run:
+                            logging.info("[DRY RUN] would snapshot zvol %s@%s", zvol_ds, tag)
+                            dataset_snapshots[zvol_ds] = True
+                        else:
+                            if create_snapshot(zvol_ds, tag, recursive=False):
+                                dataset_snapshots[zvol_ds] = True
+                                snapshots_created.append((zvol_ds, tag, False))
+                            else:
+                                logging.warning("Failed to snapshot zvol %s", zvol_ds)
+
+                    if dataset_snapshots.get(zvol_ds):
+                        # Snapshot path for zvol: /dev/zvol/<dataset>@<snapshot>
+                        snap_path = Path(f"/dev/zvol/{zvol_ds}@{tag}")
+                        disk_to_snapshot_path[source_path] = snap_path
+                    else:
+                        # Snapshot failed
+                        if fallback:
+                            logging.warning("Zvol snapshot failed for %s, using live disk", source_path)
+                            disk_to_snapshot_path[source_path] = source_path
+                        else:
+                            warnings.append(f"Zvol snapshot failed & no fallback for {vm_name} disk {source_path}")
+                else:
+                    # Not a zvol format we recognize
+                    if fallback:
+                        logging.warning("Cannot parse zvol path %s, using live disk", source_path)
+                        disk_to_snapshot_path[source_path] = source_path
+                    else:
+                        warnings.append(f"Cannot parse zvol path & no fallback for {vm_name} disk {source_path}")
+
+            elif disk_type == 'file':
+                # Regular file: /mnt/user/domains/vm1/vdisk1.qcow2
+                # Find parent dataset
+                ds, mnt = dataset_for_path(source_path.parent)
+                if ds and mnt:
+                    # Snapshot the dataset containing the file
+                    if ds not in dataset_snapshots:
+                        if dry_run:
+                            logging.info("[DRY RUN] would snapshot %s@%s", ds, tag)
+                            dataset_snapshots[ds] = True
+                        else:
+                            if create_snapshot(ds, tag, recursive=False):
+                                dataset_snapshots[ds] = True
+                                snapshots_created.append((ds, tag, False))
+                            else:
+                                logging.warning("Failed to snapshot dataset %s", ds)
+
+                    if dataset_snapshots.get(ds):
+                        # Build snapshot path via .zfs/snapshot
+                        rel_path = source_path.relative_to(mnt)
+                        snap_path = snapshot_path_for(mnt, tag, str(rel_path))
+                        disk_to_snapshot_path[source_path] = snap_path
+                    else:
+                        # Snapshot failed
+                        if fallback:
+                            logging.warning("Dataset snapshot failed for %s, using live disk", source_path)
+                            disk_to_snapshot_path[source_path] = source_path
+                        else:
+                            warnings.append(f"Dataset snapshot failed & no fallback for {vm_name} disk {source_path}")
+                else:
+                    # No ZFS dataset found
+                    if fallback:
+                        logging.warning("No ZFS dataset for %s, using live disk", source_path)
+                        disk_to_snapshot_path[source_path] = source_path
+                    else:
+                        warnings.append(f"No ZFS dataset & no fallback for {vm_name} disk {source_path}")
+            else:
+                # Unknown disk type
+                if fallback:
+                    logging.warning("Unknown disk type %s for %s, using live", disk_type, source_path)
+                    disk_to_snapshot_path[source_path] = source_path
+                else:
+                    warnings.append(f"Unknown disk type & no fallback for {vm_name} disk {source_path}")
+
+        elif snapshot and not zfs_ok:
+            # ZFS not available but snapshot requested
+            if fallback:
+                logging.warning("ZFS unavailable for VM %s disk %s, using live", vm_name, source_path)
+                disk_to_snapshot_path[source_path] = source_path
+            else:
+                warnings.append(f"ZFS unavailable & no fallback for {vm_name} disk {source_path}")
+        else:
+            # snapshot=false, use live
+            disk_to_snapshot_path[source_path] = source_path
+
+    # === Build PxarEntry for each disk ===
+    for disk_info in disks:
+        source_path = disk_info['source_path']
+        if source_path not in disk_to_snapshot_path:
+            continue  # Skipped due to error
+
+        backup_path = disk_to_snapshot_path[source_path]
+        target_dev = disk_info['target_dev']
+
+        # Label: preserve disk filename for files, use zvol name for zvols
+        if disk_info['disk_type'] == 'file':
+            # Use the filename without extension for label
+            label = source_path.stem  # e.g., vdisk1.qcow2 -> vdisk1
+        else:
+            # For zvols, use the last component of the path
+            label = source_path.name  # e.g., /dev/zvol/.../disk0 -> disk0
+
+        label = sanitize_label(label)
+
+        is_using_live = (backup_path == source_path and snapshot)
+
+        entry = PxarEntry(
+            label=label,
+            src_path=backup_path,
+            repositories=repositories,
+            namespace=base_namespace,
+            backup_id_override=vm_name,  # Each VM = separate backup-id
+            note=f"VM {vm_name} disk {target_dev} ({source_path})" + (" [LIVE]" if is_using_live else ""),
+            snapshot_required=False,
+            warned=is_using_live,
+        )
+        entries.append(entry)
+
+    # === Add VM config file ===
+    if config_file and config_file.exists():
+        config_entry = PxarEntry(
+            label="vm-config",
+            src_path=config_file,
+            repositories=repositories,
+            namespace=base_namespace,
+            backup_id_override=vm_name,
+            note=f"VM {vm_name} configuration",
+            snapshot_required=False,
+            warned=False,
+        )
+        entries.append(config_entry)
+    else:
+        logging.warning("VM config file not found: %s", config_file)
+
+    return entries, snapshots_created, warnings
+
 def consolidate_and_dedupe(entries: List[PxarEntry]) -> List[PxarEntry]:
     labels = [e.label for e in entries]
     fixed = dedupe_labels(labels)
@@ -744,14 +1135,29 @@ def main():
         logging.warning("No 'repositories' configured; folders referencing repos will fail.")
 
     section = cfg.get(args.section, {}) or {}
-    section_defaults = {k: v for k, v in section.items() if k != "folders"}
-    folders = section.get("folders", []) or []
 
     pbc_binary = args.pbc_binary or global_defaults.get("pbc_binary") or "proxmox-backup-client"
 
-    if not folders:
-        logging.info("No folders under section '%s'. Nothing to do.", args.section)
-        sys.exit(0)
+    # Handle different section types
+    is_vm_section = (args.section == "vm")
+
+    if is_vm_section:
+        # VM section uses auto_discover instead of folders
+        section_defaults = {k: v for k, v in section.items() if k not in ["auto_discover", "manual_vms"]}
+        auto_discover_cfg = section.get("auto_discover", {}) or {}
+        manual_vms = section.get("manual_vms", []) or []
+
+        if not auto_discover_cfg and not manual_vms:
+            logging.info("No auto_discover or manual_vms configured under section '%s'. Nothing to do.", args.section)
+            sys.exit(0)
+    else:
+        # Host/CT section uses folders
+        section_defaults = {k: v for k, v in section.items() if k != "folders"}
+        folders = section.get("folders", []) or []
+
+        if not folders:
+            logging.info("No folders under section '%s'. Nothing to do.", args.section)
+            sys.exit(0)
 
     # notifications: start
     if not args.dry_run:
@@ -762,24 +1168,59 @@ def main():
     all_entries: List[PxarEntry] = []
     all_warnings: List[str] = []
     union_cleanups: List[Tuple[List[Path], Optional[Path], Optional[Tuple[str, str, bool]]]] = []  # (umounts, union_root, destroy_spec)
+    vm_snapshots_to_cleanup: List[Tuple[str, str, bool]] = []  # (dataset, tag, recursive) for VMs
 
     try:
-        for fcfg in folders:
-            if isinstance(fcfg, str):
-                fcfg = {"path": fcfg}
-            if "path" not in fcfg:
-                msg = f"Folder entry missing 'path': {fcfg}"
-                logging.warning(msg)
-                all_warnings.append(msg)
-                continue
-            entries, _created_snaps_unused, warns = plan_for_folder(
-                fcfg, section_defaults, global_defaults, dry_run=args.dry_run, section_name=args.section
-            )
-            for e in entries:
-                if e.cleanup_unmounts or e.cleanup_union_root or e.destroy_snapshot_spec:
-                    union_cleanups.append((e.cleanup_unmounts, e.cleanup_union_root, e.destroy_snapshot_spec))
-            all_entries.extend(entries)
-            all_warnings.extend(warns)
+        if is_vm_section:
+            # === VM Section: Auto-discover and backup VMs ===
+            discovered_vms = []
+
+            # Auto-discover VMs from libvirt
+            if auto_discover_cfg and auto_discover_cfg.get('enabled', True):
+                discovered_vms = discover_vms_from_libvirt(auto_discover_cfg, section_defaults)
+                logging.info("Auto-discovered %d VM(s)", len(discovered_vms))
+
+            # TODO: Add manual_vms support in future
+
+            # Plan backup for each discovered VM
+            for vm_entry in discovered_vms:
+                # Expand namespace template if specified
+                ns_template = vm_entry.get('namespace', '')
+                if ns_template:
+                    expanded_ns = expand_template(
+                        ns_template,
+                        vm=vm_entry['name'],
+                        host=socket.gethostname(),
+                        section=args.section
+                    )
+                    vm_entry['namespace'] = sanitize_namespace(expanded_ns) if expanded_ns else None
+
+                entries, snaps, warns = plan_vm_backup(
+                    vm_entry, section_defaults, global_defaults,
+                    dry_run=args.dry_run, section_name=args.section
+                )
+                all_entries.extend(entries)
+                all_warnings.extend(warns)
+                vm_snapshots_to_cleanup.extend(snaps)
+
+        else:
+            # === Host/CT Section: Process folders ===
+            for fcfg in folders:
+                if isinstance(fcfg, str):
+                    fcfg = {"path": fcfg}
+                if "path" not in fcfg:
+                    msg = f"Folder entry missing 'path': {fcfg}"
+                    logging.warning(msg)
+                    all_warnings.append(msg)
+                    continue
+                entries, _created_snaps_unused, warns = plan_for_folder(
+                    fcfg, section_defaults, global_defaults, dry_run=args.dry_run, section_name=args.section
+                )
+                for e in entries:
+                    if e.cleanup_unmounts or e.cleanup_union_root or e.destroy_snapshot_spec:
+                        union_cleanups.append((e.cleanup_unmounts, e.cleanup_union_root, e.destroy_snapshot_spec))
+                all_entries.extend(entries)
+                all_warnings.extend(warns)
 
         if not all_entries:
             logging.info("No eligible folders (none had 'repositories' or all skipped).")
@@ -868,6 +1309,13 @@ def main():
                     logging.info("[DRY RUN] would destroy snapshot %s@%s%s", ds, tag, " (-r)" if rec else "")
                 else:
                     destroy_snapshot(ds, tag, recursive=rec)
+
+        # Cleanup VM snapshots
+        for ds, tag, rec in vm_snapshots_to_cleanup:
+            if args.dry_run:
+                logging.info("[DRY RUN] would destroy VM snapshot %s@%s%s", ds, tag, " (-r)" if rec else "")
+            else:
+                destroy_snapshot(ds, tag, recursive=rec)
 
         if not args.dry_run:
             notify_discord(dc_url, f"Backup run finished on {socket.gethostname()} (section: {args.section})",
