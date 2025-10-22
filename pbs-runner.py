@@ -858,6 +858,11 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
     repositories = vm_entry['repositories']
     base_namespace = vm_entry.get('namespace')
 
+    # Sanitize VM name for use as backup-id (PBS requires no spaces, special chars)
+    vm_backup_id = sanitize_label(vm_name)
+    if vm_backup_id != vm_name:
+        logging.info("VM name '%s' sanitized to '%s' for backup-id", vm_name, vm_backup_id)
+
     if not repositories:
         logging.info("VM %s has no repositories, skipping", vm_name)
         return [], [], []
@@ -1012,7 +1017,7 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
             src_path=backup_path,
             repositories=repositories,
             namespace=base_namespace,
-            backup_id_override=vm_name,  # Each VM = separate backup-id
+            backup_id_override=vm_backup_id,  # Each VM = separate backup-id (sanitized)
             note=f"VM {vm_name} disk {target_dev} ({source_path})" + (" [LIVE]" if is_using_live else ""),
             snapshot_required=False,
             warned=is_using_live,
@@ -1026,7 +1031,7 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
             src_path=config_file,
             repositories=repositories,
             namespace=base_namespace,
-            backup_id_override=vm_name,
+            backup_id_override=vm_backup_id,  # Use sanitized backup-id
             note=f"VM {vm_name} configuration",
             snapshot_required=False,
             warned=False,
