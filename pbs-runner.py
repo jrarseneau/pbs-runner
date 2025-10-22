@@ -525,7 +525,8 @@ class PxarEntry:
         union_root: Optional[Path] = None,
         cleanup_unmounts: Optional[List[Path]] = None,
         cleanup_union_root: Optional[Path] = None,
-        destroy_snapshot_spec: Optional[Tuple[str, str, bool]] = None
+        destroy_snapshot_spec: Optional[Tuple[str, str, bool]] = None,
+        archive_type: str = "pxar"  # pxar, img.fidx, blob
     ):
         self.label = label
         self.src_path = src_path
@@ -540,9 +541,10 @@ class PxarEntry:
         self.cleanup_unmounts = cleanup_unmounts or []
         self.cleanup_union_root = cleanup_union_root
         self.destroy_snapshot_spec = destroy_snapshot_spec  # (parent_ds, tag, recursive_bool)
+        self.archive_type = archive_type
 
     def as_arg(self) -> str:
-        return f"{self.label}.pxar:{self.src_path}"
+        return f"{self.label}.{self.archive_type}:{self.src_path}"
 
 # =========================
 # Repo env helpers
@@ -1000,14 +1002,9 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
         backup_path = disk_to_snapshot_path[source_path]
         target_dev = disk_info['target_dev']
 
-        # Label: preserve disk filename for files, use zvol name for zvols
-        if disk_info['disk_type'] == 'file':
-            # Use the filename without extension for label
-            label = source_path.stem  # e.g., vdisk1.qcow2 -> vdisk1
-        else:
-            # For zvols, use the last component of the path
-            label = source_path.name  # e.g., /dev/zvol/.../disk0 -> disk0
-
+        # Label: use drive-<target> format (e.g., drive-vda, drive-scsi0)
+        # This matches Proxmox VE backup naming convention
+        label = f"drive-{target_dev}"
         label = sanitize_label(label)
 
         is_using_live = (backup_path == source_path and snapshot)
@@ -1021,13 +1018,14 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
             note=f"VM {vm_name} disk {target_dev} ({source_path})" + (" [LIVE]" if is_using_live else ""),
             snapshot_required=False,
             warned=is_using_live,
+            archive_type="img.fidx",  # Disk images use .img.fidx format
         )
         entries.append(entry)
 
     # === Add VM config file ===
     if config_file and config_file.exists():
         config_entry = PxarEntry(
-            label="vm-config",
+            label="qemu-server.conf",  # Standard PBS VM config name
             src_path=config_file,
             repositories=repositories,
             namespace=base_namespace,
@@ -1035,6 +1033,7 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
             note=f"VM {vm_name} configuration",
             snapshot_required=False,
             warned=False,
+            archive_type="blob",  # Config files use .blob format
         )
         entries.append(config_entry)
     else:
@@ -1065,7 +1064,7 @@ def build_pbc_command(entries: List[PxarEntry], ns: Optional[str], backup_id: st
 
     args = [pbc_binary, "backup"]
     for e in entries:
-        args.append(f"{e.label}.pxar:{e.src_path}")
+        args.append(e.as_arg())
     # include-dev for any union-mounted children
     include_paths = []
     for e in entries:
@@ -1104,7 +1103,7 @@ def print_plan_for_group(repo_alias: str, ns: Optional[str], backup_id: str, ent
         flag = " (REQUIRES SNAPSHOT BUT UNAVAILABLE)" if e.snapshot_required else ""
         warn = " [FALLBACK TO LIVE]" if e.warned else ""
         note = f"  # {e.note}" if e.note else ""
-        logging.info("  - %s.pxar:%s%s%s%s", e.label, e.src_path, flag, warn, note)
+        logging.info("  - %s.%s:%s%s%s%s", e.label, e.archive_type, e.src_path, flag, warn, note)
         for inc in (e.include_devs or []):
             logging.info("    --include-dev %s", inc)
 
