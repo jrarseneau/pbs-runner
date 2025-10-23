@@ -1024,8 +1024,12 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
 
     # === Add VM config file ===
     if config_file and config_file.exists():
+        # Use VM name + .xml for the label (e.g., Windows_11.xml)
+        # PBS will add .conf type, resulting in Windows_11.xml.conf.blob on server
+        config_label = f"{vm_backup_id}.xml"
+
         config_entry = PxarEntry(
-            label="qemu-server",  # PBS will create qemu-server.conf.blob on server
+            label=config_label,
             src_path=config_file,
             repositories=repositories,
             namespace=base_namespace,
