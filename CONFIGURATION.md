@@ -93,7 +93,7 @@ directory as **one pxar**, adding `--include-dev` for each child bind.
 
 ## Sections: `host`, `vm`, `ct`
 
-Only one section is executed per run via `--section` (default `host`).
+Only one section is executed per run via `--type` (default `host`).
 
 Common section-level keys (override `defaults` for that section):
 

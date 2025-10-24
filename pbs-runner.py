@@ -1119,7 +1119,7 @@ def print_plan_for_group(repo_alias: str, ns: Optional[str], backup_id: str, ent
 def main():
     ap = argparse.ArgumentParser(description="pbs-runner: Plan & run proxmox-backup-client backups from YAML config")
     ap.add_argument("-c", "--config", required=True, help="Path to YAML config")
-    ap.add_argument("--section", default="host", help="Top-level section to run (host|vm|ct). Default: host")
+    ap.add_argument("--type", default="host", help="Backup type to run (vm|ct|host). Default: host")
     ap.add_argument("--dry-run", action="store_true", help="Print actions & commands without executing")
     ap.add_argument("--pbc-binary", default=None, help="Override path/name of proxmox-backup-client")
     args = ap.parse_args()
@@ -1143,12 +1143,12 @@ def main():
     if not repositories_cfg:
         logging.warning("No 'repositories' configured; folders referencing repos will fail.")
 
-    section = cfg.get(args.section, {}) or {}
+    section = cfg.get(args.type, {}) or {}
 
     pbc_binary = args.pbc_binary or global_defaults.get("pbc_binary") or "proxmox-backup-client"
 
     # Handle different section types
-    is_vm_section = (args.section == "vm")
+    is_vm_section = (args.type == "vm")
 
     if is_vm_section:
         # VM section uses auto_discover instead of folders
@@ -1157,7 +1157,7 @@ def main():
         manual_vms = section.get("manual_vms", []) or []
 
         if not auto_discover_cfg and not manual_vms:
-            logging.info("No auto_discover or manual_vms configured under section '%s'. Nothing to do.", args.section)
+            logging.info("No auto_discover or manual_vms configured for type '%s'. Nothing to do.", args.type)
             sys.exit(0)
     else:
         # Host/CT section uses folders
@@ -1165,13 +1165,13 @@ def main():
         folders = section.get("folders", []) or []
 
         if not folders:
-            logging.info("No folders under section '%s'. Nothing to do.", args.section)
+            logging.info("No folders for type '%s'. Nothing to do.", args.type)
             sys.exit(0)
 
     # notifications: start
     if not args.dry_run:
         notify_healthchecks(hc_url, "start")
-        notify_discord(dc_url, f"Backup run started on {socket.gethostname()} (section: {args.section})",
+        notify_discord(dc_url, f"Backup run started on {socket.gethostname()} (type: {args.type})",
                        prefix=dc_pref, notify_on=dc_evts, event="start")
 
     all_entries: List[PxarEntry] = []
@@ -1200,13 +1200,13 @@ def main():
                         ns_template,
                         vm=vm_entry['name'],
                         host=socket.gethostname(),
-                        section=args.section
+                        section=args.type
                     )
                     vm_entry['namespace'] = sanitize_namespace(expanded_ns) if expanded_ns else None
 
                 entries, snaps, warns = plan_vm_backup(
                     vm_entry, section_defaults, global_defaults,
-                    dry_run=args.dry_run, section_name=args.section
+                    dry_run=args.dry_run, section_name=args.type
                 )
                 all_entries.extend(entries)
                 all_warnings.extend(warns)
@@ -1223,7 +1223,7 @@ def main():
                     all_warnings.append(msg)
                     continue
                 entries, _created_snaps_unused, warns = plan_for_folder(
-                    fcfg, section_defaults, global_defaults, dry_run=args.dry_run, section_name=args.section
+                    fcfg, section_defaults, global_defaults, dry_run=args.dry_run, section_name=args.type
                 )
                 for e in entries:
                     if e.cleanup_unmounts or e.cleanup_union_root or e.destroy_snapshot_spec:
@@ -1248,7 +1248,7 @@ def main():
 
         for (repo_alias, ns, bid), entries in groups.items():
             had_fallback = any(e.warned for e in entries)
-            print_plan_for_group(repo_alias, ns, bid, entries, args.section)
+            print_plan_for_group(repo_alias, ns, bid, entries, args.type)
 
             env = repo_env_from_cfg(repositories_cfg, repo_alias)
             if env is None:
@@ -1274,12 +1274,12 @@ def main():
                 notify_healthchecks(hc_url, "failure")
                 notify_discord(
                     dc_url,
-                    f"❌ Backup FAILED on {socket.gethostname()} repo={repo_alias} ns={ns or '(root)'} bid={bid} (section: {args.section}) rc={rc}",
+                    f"❌ Backup FAILED on {socket.gethostname()} repo={repo_alias} ns={ns or '(root)'} bid={bid} (type: {args.type}) rc={rc}",
                     prefix=dc_pref, notify_on=dc_evts, event="failure"
                 )
             else:
                 if had_fallback:
-                    msg = f"⚠️ Backup SUCCEEDED with FALLBACK(S) on {socket.gethostname()} repo={repo_alias} ns={ns or '(root)'} bid={bid} (section: {args.section}). See logs."
+                    msg = f"⚠️ Backup SUCCEEDED with FALLBACK(S) on {socket.gethostname()} repo={repo_alias} ns={ns or '(root)'} bid={bid} (type: {args.type}). See logs."
                     logging.warning(msg)
                     notify_discord(dc_url, msg, prefix=dc_pref, notify_on=dc_evts, event="fallback")
                 else:
@@ -1289,7 +1289,7 @@ def main():
             if exit_code == 0:
                 notify_healthchecks(hc_url, "success")
                 notify_discord(dc_url,
-                               f"✅ Backup SUCCESS on {socket.gethostname()} (section: {args.section})",
+                               f"✅ Backup SUCCESS on {socket.gethostname()} (type: {args.type})",
                                prefix=dc_pref, notify_on=dc_evts, event="success")
 
         if args.dry_run:
@@ -1327,7 +1327,7 @@ def main():
                 destroy_snapshot(ds, tag, recursive=rec)
 
         if not args.dry_run:
-            notify_discord(dc_url, f"Backup run finished on {socket.gethostname()} (section: {args.section})",
+            notify_discord(dc_url, f"Backup run finished on {socket.gethostname()} (type: {args.type})",
                            prefix=dc_pref, notify_on=dc_evts, event="finish")
 
 if __name__ == "__main__":
