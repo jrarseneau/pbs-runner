@@ -1119,7 +1119,7 @@ def print_plan_for_group(repo_alias: str, ns: Optional[str], backup_id: str, ent
 def main():
     ap = argparse.ArgumentParser(description="pbs-runner: Plan & run proxmox-backup-client backups from YAML config")
     ap.add_argument("-c", "--config", required=True, help="Path to YAML config")
-    ap.add_argument("--type", default="host", help="Backup type to run (vm|ct|host). Default: host")
+    ap.add_argument("--type", default=None, help="Backup type to run (vm|ct|host). Default: all types defined in config")
     ap.add_argument("--dry-run", action="store_true", help="Print actions & commands without executing")
     ap.add_argument("--pbc-binary", default=None, help="Override path/name of proxmox-backup-client")
     args = ap.parse_args()
@@ -1143,163 +1143,228 @@ def main():
     if not repositories_cfg:
         logging.warning("No 'repositories' configured; folders referencing repos will fail.")
 
-    section = cfg.get(args.type, {}) or {}
+    # Determine which types to process
+    if args.type:
+        types_to_process = [args.type]
+    else:
+        # Auto-detect all valid types from config
+        valid_types = ['ct', 'host', 'vm']  # alphabetical order
+        types_to_process = []
+        for type_name in valid_types:
+            section = cfg.get(type_name, {}) or {}
+            if not section:
+                continue
+
+            # Check if type has content to process
+            if type_name == 'vm':
+                auto_discover_cfg = section.get("auto_discover", {}) or {}
+                manual_vms = section.get("manual_vms", []) or []
+                if auto_discover_cfg or manual_vms:
+                    types_to_process.append(type_name)
+            else:
+                # host or ct: check for folders
+                folders = section.get("folders", []) or []
+                if folders:
+                    types_to_process.append(type_name)
+
+        if not types_to_process:
+            logging.info("No valid types with content found in config. Nothing to do.")
+            sys.exit(0)
+
+        logging.info("Auto-detected types to process: %s", ", ".join(types_to_process))
 
     pbc_binary = args.pbc_binary or global_defaults.get("pbc_binary") or "proxmox-backup-client"
 
-    # Handle different section types
-    is_vm_section = (args.type == "vm")
-
-    if is_vm_section:
-        # VM section uses auto_discover instead of folders
-        section_defaults = {k: v for k, v in section.items() if k not in ["auto_discover", "manual_vms"]}
-        auto_discover_cfg = section.get("auto_discover", {}) or {}
-        manual_vms = section.get("manual_vms", []) or []
-
-        if not auto_discover_cfg and not manual_vms:
-            logging.info("No auto_discover or manual_vms configured for type '%s'. Nothing to do.", args.type)
-            sys.exit(0)
-    else:
-        # Host/CT section uses folders
-        section_defaults = {k: v for k, v in section.items() if k != "folders"}
-        folders = section.get("folders", []) or []
-
-        if not folders:
-            logging.info("No folders for type '%s'. Nothing to do.", args.type)
-            sys.exit(0)
-
-    # notifications: start
+    # notifications: start (send once before processing all types)
     if not args.dry_run:
         notify_healthchecks(hc_url, "start")
-        notify_discord(dc_url, f"Backup run started on {socket.gethostname()} (type: {args.type})",
+        types_display = ", ".join(types_to_process)
+        notify_discord(dc_url, f"Backup run started on {socket.gethostname()} (types: {types_display})",
                        prefix=dc_pref, notify_on=dc_evts, event="start")
 
-    all_entries: List[PxarEntry] = []
-    all_warnings: List[str] = []
-    union_cleanups: List[Tuple[List[Path], Optional[Path], Optional[Tuple[str, str, bool]]]] = []  # (umounts, union_root, destroy_spec)
-    vm_snapshots_to_cleanup: List[Tuple[str, str, bool]] = []  # (dataset, tag, recursive) for VMs
+    # Accumulate cleanups and exit codes across all types
+    all_union_cleanups: List[Tuple[List[Path], Optional[Path], Optional[Tuple[str, str, bool]]]] = []  # (umounts, union_root, destroy_spec)
+    all_vm_snapshots_to_cleanup: List[Tuple[str, str, bool]] = []  # (dataset, tag, recursive) for VMs
+    overall_exit_code = 0
+    any_type_had_fallback = False
 
     try:
-        if is_vm_section:
-            # === VM Section: Auto-discover and backup VMs ===
-            discovered_vms = []
+        # Process each type in alphabetical order
+        for current_type in types_to_process:
+            logging.info("")
+            logging.info("=" * 70)
+            logging.info("Processing type: %s", current_type)
+            logging.info("=" * 70)
+            logging.info("")
 
-            # Auto-discover VMs from libvirt
-            if auto_discover_cfg and auto_discover_cfg.get('enabled', True):
-                discovered_vms = discover_vms_from_libvirt(auto_discover_cfg, section_defaults)
-                logging.info("Auto-discovered %d VM(s)", len(discovered_vms))
+            section = cfg.get(current_type, {}) or {}
 
-            # TODO: Add manual_vms support in future
+            # Handle different section types
+            is_vm_section = (current_type == "vm")
 
-            # Plan backup for each discovered VM
-            for vm_entry in discovered_vms:
-                # Expand namespace template if specified
-                ns_template = vm_entry.get('namespace', '')
-                if ns_template:
-                    expanded_ns = expand_template(
-                        ns_template,
-                        vm=vm_entry['name'],
-                        host=socket.gethostname(),
-                        section=args.type
-                    )
-                    vm_entry['namespace'] = sanitize_namespace(expanded_ns) if expanded_ns else None
+            if is_vm_section:
+                # VM section uses auto_discover instead of folders
+                section_defaults = {k: v for k, v in section.items() if k not in ["auto_discover", "manual_vms"]}
+                auto_discover_cfg = section.get("auto_discover", {}) or {}
+                manual_vms = section.get("manual_vms", []) or []
 
-                entries, snaps, warns = plan_vm_backup(
-                    vm_entry, section_defaults, global_defaults,
-                    dry_run=args.dry_run, section_name=args.type
-                )
-                all_entries.extend(entries)
-                all_warnings.extend(warns)
-                vm_snapshots_to_cleanup.extend(snaps)
-
-        else:
-            # === Host/CT Section: Process folders ===
-            for fcfg in folders:
-                if isinstance(fcfg, str):
-                    fcfg = {"path": fcfg}
-                if "path" not in fcfg:
-                    msg = f"Folder entry missing 'path': {fcfg}"
-                    logging.warning(msg)
-                    all_warnings.append(msg)
+                if not auto_discover_cfg and not manual_vms:
+                    logging.info("No auto_discover or manual_vms configured for type '%s'. Skipping.", current_type)
                     continue
-                entries, _created_snaps_unused, warns = plan_for_folder(
-                    fcfg, section_defaults, global_defaults, dry_run=args.dry_run, section_name=args.type
-                )
-                for e in entries:
-                    if e.cleanup_unmounts or e.cleanup_union_root or e.destroy_snapshot_spec:
-                        union_cleanups.append((e.cleanup_unmounts, e.cleanup_union_root, e.destroy_snapshot_spec))
-                all_entries.extend(entries)
-                all_warnings.extend(warns)
-
-        if not all_entries:
-            logging.info("No eligible folders (none had 'repositories' or all skipped).")
-            sys.exit(0)
-
-        all_entries = consolidate_and_dedupe(all_entries)
-
-        default_backup_id = section_defaults.get("backup_id") or socket.gethostname()
-        groups: Dict[Tuple[str, Optional[str], str], List[PxarEntry]] = collections.defaultdict(list)
-        for e in all_entries:
-            eff_bid = e.backup_id_override or default_backup_id
-            for repo_alias in e.repositories:
-                groups[(repo_alias, e.namespace, eff_bid)].append(e)
-
-        exit_code = 0
-
-        for (repo_alias, ns, bid), entries in groups.items():
-            had_fallback = any(e.warned for e in entries)
-            print_plan_for_group(repo_alias, ns, bid, entries, args.type)
-
-            env = repo_env_from_cfg(repositories_cfg, repo_alias)
-            if env is None:
-                logging.error("Skipping group (repo-alias=%s) due to missing/invalid repository config.", repo_alias)
-                exit_code = exit_code or 2
-                continue
-
-            cmd = build_pbc_command(entries, ns, bid, section_defaults, global_defaults, pbc_binary)
-
-            if args.dry_run:
-                import shlex
-                logging.info("DRY RUN - would set env: PBS_REPOSITORY=%s PBS_PASSWORD=%s PBS_FINGERPRINT=%s",
-                             env.get("PBS_REPOSITORY", ""),
-                             masked(env.get("PBS_PASSWORD")),
-                             env.get("PBS_FINGERPRINT", ""))
-                logging.info("DRY RUN - would execute: %s", shlex.join(cmd))
-                continue
-
-            rc = run_command(cmd, env=env)
-            if rc != 0:
-                exit_code = rc
-                logging.error("Backup FAILED for repo-alias=%s ns=%s bid=%s (rc=%s).", repo_alias, ns or "(root)", bid, rc)
-                notify_healthchecks(hc_url, "failure")
-                notify_discord(
-                    dc_url,
-                    f"❌ Backup FAILED on {socket.gethostname()} repo={repo_alias} ns={ns or '(root)'} bid={bid} (type: {args.type}) rc={rc}",
-                    prefix=dc_pref, notify_on=dc_evts, event="failure"
-                )
             else:
-                if had_fallback:
-                    msg = f"⚠️ Backup SUCCEEDED with FALLBACK(S) on {socket.gethostname()} repo={repo_alias} ns={ns or '(root)'} bid={bid} (type: {args.type}). See logs."
-                    logging.warning(msg)
-                    notify_discord(dc_url, msg, prefix=dc_pref, notify_on=dc_evts, event="fallback")
-                else:
-                    logging.info("Backup SUCCESS for repo=%s ns=%s bid=%s.", repo_alias, ns or "(root)", bid)
+                # Host/CT section uses folders
+                section_defaults = {k: v for k, v in section.items() if k != "folders"}
+                folders = section.get("folders", []) or []
 
+                if not folders:
+                    logging.info("No folders for type '%s'. Skipping.", current_type)
+                    continue
+
+            all_entries: List[PxarEntry] = []
+            all_warnings: List[str] = []
+            union_cleanups: List[Tuple[List[Path], Optional[Path], Optional[Tuple[str, str, bool]]]] = []  # (umounts, union_root, destroy_spec)
+            vm_snapshots_to_cleanup: List[Tuple[str, str, bool]] = []  # (dataset, tag, recursive) for VMs
+
+            if is_vm_section:
+                # === VM Section: Auto-discover and backup VMs ===
+                discovered_vms = []
+
+                # Auto-discover VMs from libvirt
+                if auto_discover_cfg and auto_discover_cfg.get('enabled', True):
+                    discovered_vms = discover_vms_from_libvirt(auto_discover_cfg, section_defaults)
+                    logging.info("Auto-discovered %d VM(s)", len(discovered_vms))
+
+                # TODO: Add manual_vms support in future
+
+                # Plan backup for each discovered VM
+                for vm_entry in discovered_vms:
+                    # Expand namespace template if specified
+                    ns_template = vm_entry.get('namespace', '')
+                    if ns_template:
+                        expanded_ns = expand_template(
+                            ns_template,
+                            vm=vm_entry['name'],
+                            host=socket.gethostname(),
+                            section=current_type
+                        )
+                        vm_entry['namespace'] = sanitize_namespace(expanded_ns) if expanded_ns else None
+
+                    entries, snaps, warns = plan_vm_backup(
+                        vm_entry, section_defaults, global_defaults,
+                        dry_run=args.dry_run, section_name=current_type
+                    )
+                    all_entries.extend(entries)
+                    all_warnings.extend(warns)
+                    vm_snapshots_to_cleanup.extend(snaps)
+
+            else:
+                # === Host/CT Section: Process folders ===
+                for fcfg in folders:
+                    if isinstance(fcfg, str):
+                        fcfg = {"path": fcfg}
+                    if "path" not in fcfg:
+                        msg = f"Folder entry missing 'path': {fcfg}"
+                        logging.warning(msg)
+                        all_warnings.append(msg)
+                        continue
+                    entries, _created_snaps_unused, warns = plan_for_folder(
+                        fcfg, section_defaults, global_defaults, dry_run=args.dry_run, section_name=current_type
+                    )
+                    for e in entries:
+                        if e.cleanup_unmounts or e.cleanup_union_root or e.destroy_snapshot_spec:
+                            union_cleanups.append((e.cleanup_unmounts, e.cleanup_union_root, e.destroy_snapshot_spec))
+                    all_entries.extend(entries)
+                    all_warnings.extend(warns)
+
+            if not all_entries:
+                logging.info("No eligible entries for type '%s' (none had 'repositories' or all skipped).", current_type)
+                continue
+
+            all_entries = consolidate_and_dedupe(all_entries)
+
+            default_backup_id = section_defaults.get("backup_id") or socket.gethostname()
+            groups: Dict[Tuple[str, Optional[str], str], List[PxarEntry]] = collections.defaultdict(list)
+            for e in all_entries:
+                eff_bid = e.backup_id_override or default_backup_id
+                for repo_alias in e.repositories:
+                    groups[(repo_alias, e.namespace, eff_bid)].append(e)
+
+            type_exit_code = 0
+
+            for (repo_alias, ns, bid), entries in groups.items():
+                had_fallback = any(e.warned for e in entries)
+                print_plan_for_group(repo_alias, ns, bid, entries, current_type)
+
+                env = repo_env_from_cfg(repositories_cfg, repo_alias)
+                if env is None:
+                    logging.error("Skipping group (repo-alias=%s) due to missing/invalid repository config.", repo_alias)
+                    type_exit_code = type_exit_code or 2
+                    continue
+
+                cmd = build_pbc_command(entries, ns, bid, section_defaults, global_defaults, pbc_binary)
+
+                if args.dry_run:
+                    import shlex
+                    logging.info("DRY RUN - would set env: PBS_REPOSITORY=%s PBS_PASSWORD=%s PBS_FINGERPRINT=%s",
+                                 env.get("PBS_REPOSITORY", ""),
+                                 masked(env.get("PBS_PASSWORD")),
+                                 env.get("PBS_FINGERPRINT", ""))
+                    logging.info("DRY RUN - would execute: %s", shlex.join(cmd))
+                    continue
+
+                rc = run_command(cmd, env=env)
+                if rc != 0:
+                    type_exit_code = rc
+                    logging.error("Backup FAILED for repo-alias=%s ns=%s bid=%s (rc=%s).", repo_alias, ns or "(root)", bid, rc)
+                    # Note: Per-group failure notification, but not healthchecks ping
+                    notify_discord(
+                        dc_url,
+                        f"❌ Backup FAILED on {socket.gethostname()} repo={repo_alias} ns={ns or '(root)'} bid={bid} (type: {current_type}) rc={rc}",
+                        prefix=dc_pref, notify_on=dc_evts, event="failure"
+                    )
+                else:
+                    if had_fallback:
+                        msg = f"⚠️ Backup SUCCEEDED with FALLBACK(S) on {socket.gethostname()} repo={repo_alias} ns={ns or '(root)'} bid={bid} (type: {current_type}). See logs."
+                        logging.warning(msg)
+                        notify_discord(dc_url, msg, prefix=dc_pref, notify_on=dc_evts, event="fallback")
+                        any_type_had_fallback = True
+                    else:
+                        logging.info("Backup SUCCESS for repo=%s ns=%s bid=%s.", repo_alias, ns or "(root)", bid)
+
+            # Accumulate cleanups from this type
+            all_union_cleanups.extend(union_cleanups)
+            all_vm_snapshots_to_cleanup.extend(vm_snapshots_to_cleanup)
+
+            # Track exit code (continue processing other types even if this one failed)
+            if type_exit_code != 0:
+                overall_exit_code = type_exit_code
+                logging.error("Type '%s' completed with errors (exit code: %s)", current_type, type_exit_code)
+            else:
+                logging.info("Type '%s' completed successfully", current_type)
+
+        # After processing all types, send final notifications
         if not args.dry_run:
-            if exit_code == 0:
+            if overall_exit_code == 0:
                 notify_healthchecks(hc_url, "success")
+                types_display = ", ".join(types_to_process)
                 notify_discord(dc_url,
-                               f"✅ Backup SUCCESS on {socket.gethostname()} (type: {args.type})",
+                               f"✅ Backup SUCCESS on {socket.gethostname()} (types: {types_display})",
                                prefix=dc_pref, notify_on=dc_evts, event="success")
+            else:
+                notify_healthchecks(hc_url, "failure")
+                types_display = ", ".join(types_to_process)
+                notify_discord(dc_url,
+                               f"❌ Backup FAILED on {socket.gethostname()} (types: {types_display}) - see logs for details",
+                               prefix=dc_pref, notify_on=dc_evts, event="failure")
 
         if args.dry_run:
             sys.exit(0)
         else:
-            sys.exit(exit_code)
+            sys.exit(overall_exit_code)
 
     finally:
         # Cleanup: unmount union binds and remove union roots; destroy recursive snapshots
-        for umounts, union_root, destroy_spec in union_cleanups:
+        for umounts, union_root, destroy_spec in all_union_cleanups:
             for m in umounts:          # children first
                 umount_path(m, dry=args.dry_run)
             if union_root:
@@ -1320,14 +1385,15 @@ def main():
                     destroy_snapshot(ds, tag, recursive=rec)
 
         # Cleanup VM snapshots
-        for ds, tag, rec in vm_snapshots_to_cleanup:
+        for ds, tag, rec in all_vm_snapshots_to_cleanup:
             if args.dry_run:
                 logging.info("[DRY RUN] would destroy VM snapshot %s@%s%s", ds, tag, " (-r)" if rec else "")
             else:
                 destroy_snapshot(ds, tag, recursive=rec)
 
         if not args.dry_run:
-            notify_discord(dc_url, f"Backup run finished on {socket.gethostname()} (type: {args.type})",
+            types_display = ", ".join(types_to_process)
+            notify_discord(dc_url, f"Backup run finished on {socket.gethostname()} (types: {types_display})",
                            prefix=dc_pref, notify_on=dc_evts, event="finish")
 
 if __name__ == "__main__":
