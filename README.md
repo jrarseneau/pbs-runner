@@ -51,10 +51,10 @@ chmod 600 config.yaml
 ## Usage
 
 ```bash
-./pbs-runner.py -c /path/to/config.yaml [--section host|vm|ct] [--dry-run] [--pbc-binary /path/to/proxmox-backup-client]
+./pbs-runner.py -c /path/to/config.yaml [--type host|vm|ct] [--dry-run] [--pbc-binary /path/to/proxmox-backup-client]
 ```
 
-- Runs **one section per invocation** (default: `host`).
+- Runs **one backup type per invocation** (default: `host`).
 - `--pbc-binary` overrides the client path if needed.
 
 ---
