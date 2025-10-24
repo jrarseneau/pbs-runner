@@ -69,6 +69,49 @@ def sh(cmd, *, capture=False, env: Optional[Dict[str, str]] = None):
         logging.error("Command not found: %s", e)
         return 127, "", str(e)
 
+def sh_with_logging(cmd, *, env: Optional[Dict[str, str]] = None):
+    """
+    Run a command and stream its output line-by-line to the logging system.
+    This ensures output appears in both console and log files.
+    Returns exit code.
+    """
+    import shlex
+    try:
+        merged_env = os.environ.copy()
+        if env:
+            merged_env.update(env)
+
+        logging.debug("SH_WITH_LOGGING: %s", shlex.join(cmd))
+
+        # Start the process with pipes for stdout/stderr
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge stderr into stdout
+            text=True,
+            bufsize=1,  # Line buffered
+            env=merged_env
+        )
+
+        # Stream output line-by-line
+        if process.stdout:
+            for line in process.stdout:
+                line = line.rstrip('\n\r')
+                if line:  # Skip empty lines
+                    logging.info(line)
+
+        # Wait for process to complete
+        rc = process.wait()
+        logging.debug("SH_WITH_LOGGING rc=%s", rc)
+        return rc
+
+    except FileNotFoundError as e:
+        logging.error("Command not found: %s", e)
+        return 127
+    except Exception as e:
+        logging.error("Command execution failed: %s", e)
+        return 1
+
 def is_dir(p: Path):
     try:
         return p.is_dir()
@@ -1097,7 +1140,7 @@ def run_command(args: List[str], env: Dict[str, str]) -> int:
     logging.info("Env: PBS_REPOSITORY=%s PBS_PASSWORD=%s PBS_FINGERPRINT=%s",
                  safe_env_log["PBS_REPOSITORY"], safe_env_log["PBS_PASSWORD"], safe_env_log["PBS_FINGERPRINT"])
     logging.info("Executing: %s", shlex.join(args))
-    rc, _, _ = sh(args, capture=False, env=env)
+    rc = sh_with_logging(args, env=env)
     logging.info("proxmox-backup-client exit code: %s", rc)
     return rc
 
