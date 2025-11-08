@@ -804,6 +804,9 @@ def plan_for_folder(folder_cfg, section_defaults, global_defaults, *, dry_run=Fa
     elif snapshot and not zfs_ok:
         logging.warning("ZFS not available but snapshot=true; fallback_to_live=%s", fallback)
 
+    # Track which datasets have been assigned for cleanup to avoid duplicates
+    ds_assigned_for_cleanup = set()
+
     for cand in candidates:
         warned = False
         snapshot_required = False
@@ -860,6 +863,15 @@ def plan_for_folder(folder_cfg, section_defaults, global_defaults, *, dry_run=Fa
             rawns = expand_template(ns_tpl, name=item_name, section=section_name, host=host)
             entry_ns = sanitize_namespace(rawns) if rawns else None
 
+        # Determine if we need to cleanup snapshot for this entry
+        destroy_spec = None
+        if snapshot and zfs_ok:
+            ds, mnt = dataset_map.get(cand, (None, None))
+            if ds and ds in ds_created_snap and ds not in ds_assigned_for_cleanup:
+                # Assign this snapshot for cleanup (only once per dataset)
+                destroy_spec = (ds, tag, False) if not dry_run else None
+                ds_assigned_for_cleanup.add(ds)
+
         entries.append(PxarEntry(
             label=label_final,
             src_path=src_path,
@@ -868,7 +880,8 @@ def plan_for_folder(folder_cfg, section_defaults, global_defaults, *, dry_run=Fa
             backup_id_override=entry_bid,
             note=note,
             snapshot_required=snapshot_required,
-            warned=(warned and snapshot)
+            warned=(warned and snapshot),
+            destroy_snapshot_spec=destroy_spec
         ))
 
     return entries, created_snaps, warnings
