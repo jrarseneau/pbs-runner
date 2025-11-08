@@ -871,7 +871,6 @@ def plan_for_folder(folder_cfg, section_defaults, global_defaults, *, dry_run=Fa
                 # Assign this snapshot for cleanup (only once per dataset)
                 destroy_spec = (ds, tag, False) if not dry_run else None
                 ds_assigned_for_cleanup.add(ds)
-                logging.info("Assigned destroy_spec for %s: %s@%s", cand, ds, tag)
 
         entries.append(PxarEntry(
             label=label_final,
@@ -1329,7 +1328,6 @@ def main():
                     )
                     for e in entries:
                         if e.cleanup_unmounts or e.cleanup_union_root or e.destroy_snapshot_spec:
-                            logging.info("Adding cleanup for entry %s: destroy_spec=%s", e.label, e.destroy_snapshot_spec)
                             union_cleanups.append((e.cleanup_unmounts, e.cleanup_union_root, e.destroy_snapshot_spec))
                     all_entries.extend(entries)
                     all_warnings.extend(warns)
@@ -1390,7 +1388,6 @@ def main():
                         logging.info("Backup SUCCESS for repo=%s ns=%s bid=%s.", repo_alias, ns or "(root)", bid)
 
             # Accumulate cleanups from this type
-            logging.info("Type '%s': Accumulating %d union_cleanups into all_union_cleanups", current_type, len(union_cleanups))
             all_union_cleanups.extend(union_cleanups)
             all_vm_snapshots_to_cleanup.extend(vm_snapshots_to_cleanup)
 
@@ -1423,7 +1420,6 @@ def main():
 
     finally:
         # Cleanup: unmount union binds and remove union roots; destroy recursive snapshots
-        logging.info("Cleanup: Processing %d union cleanups", len(all_union_cleanups))
         for umounts, union_root, destroy_spec in all_union_cleanups:
             for m in umounts:          # children first
                 umount_path(m, dry=args.dry_run)
@@ -1439,7 +1435,6 @@ def main():
 
             if destroy_spec:
                 ds, tag, rec = destroy_spec
-                logging.info("Cleanup: Found destroy_spec: %s@%s (recursive=%s)", ds, tag, rec)
                 if args.dry_run:
                     logging.info("[DRY RUN] would destroy snapshot %s@%s%s", ds, tag, " (-r)" if rec else "")
                 else:
