@@ -407,6 +407,10 @@ def cleanup_orphaned_snapshots(hostname: str, max_age_hours: int = 24, dry_run: 
 
     total_found = 0
     total_deleted = 0
+    total_kept_recent = 0
+    total_parse_failed = 0
+    oldest_kept_age = 0.0
+    newest_kept_age = float('inf')
 
     for line in out.splitlines():
         if not line.strip():
@@ -463,22 +467,39 @@ def cleanup_orphaned_snapshots(hostname: str, max_age_hours: int = 24, dry_run: 
                                           snapshot_name, err_del.strip())
                 else:
                     age_hours = (now - snapshot_time).total_seconds() / 3600
+                    total_kept_recent += 1
+                    oldest_kept_age = max(oldest_kept_age, age_hours)
+                    newest_kept_age = min(newest_kept_age, age_hours)
                     logging.debug("Snapshot %s is recent (age: %.1f hours), keeping",
                                 snapshot_name, age_hours)
             else:
-                logging.debug("Could not parse timestamp from snapshot name: %s", tag)
+                total_parse_failed += 1
+                logging.warning("Could not parse timestamp from snapshot name: %s", tag)
 
         except ValueError as e:
-            logging.debug("Could not parse timestamp from snapshot %s: %s", snapshot_name, e)
+            total_parse_failed += 1
+            logging.warning("Could not parse timestamp from snapshot %s: %s", snapshot_name, e)
             continue
 
+    # Provide detailed summary
     if total_found > 0:
+        kept_msg = ""
+        if total_kept_recent > 0:
+            if newest_kept_age == float('inf'):
+                kept_msg = f", kept {total_kept_recent} recent (all under {max_age_hours}h threshold)"
+            else:
+                kept_msg = f", kept {total_kept_recent} recent (age range: {newest_kept_age:.1f}h - {oldest_kept_age:.1f}h, threshold: {max_age_hours}h)"
+
+        parse_msg = ""
+        if total_parse_failed > 0:
+            parse_msg = f", {total_parse_failed} parse failures"
+
         if dry_run:
-            logging.info("Orphaned snapshot cleanup [DRY RUN]: found %d pbsbkp snapshots, would delete %d",
-                       total_found, total_deleted)
+            logging.info("Orphaned snapshot cleanup [DRY RUN]: found %d pbsbkp snapshots, would delete %d%s%s",
+                       total_found, total_deleted, kept_msg, parse_msg)
         else:
-            logging.info("Orphaned snapshot cleanup: found %d pbsbkp snapshots, deleted %d",
-                       total_found, total_deleted)
+            logging.info("Orphaned snapshot cleanup: found %d pbsbkp snapshots, deleted %d%s%s",
+                       total_found, total_deleted, kept_msg, parse_msg)
     else:
         logging.debug("No orphaned pbsbkp snapshots found")
 
@@ -1346,7 +1367,8 @@ def main():
 
     # Clean up orphaned snapshots from previous failed runs
     hostname = socket.gethostname()
-    cleanup_orphaned_snapshots(hostname, max_age_hours=24, dry_run=args.dry_run)
+    cleanup_threshold = global_defaults.get("orphaned_snapshot_max_age_hours", 24)
+    cleanup_orphaned_snapshots(hostname, max_age_hours=cleanup_threshold, dry_run=args.dry_run)
 
     notifications = cfg.get("notifications", {}) or {}
     hc_url = (notifications.get("healthcheck_url") or "").strip()
