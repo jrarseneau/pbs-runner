@@ -19,6 +19,7 @@ Key features:
 import argparse
 import collections
 import datetime as dt
+import fcntl
 import json
 import logging
 import logging.handlers
@@ -46,6 +47,48 @@ except Exception:
 # =========================
 # Shell & small utilities
 # =========================
+
+# Global to hold the lock file descriptor
+_lockfile_fd = None
+
+def acquire_single_instance_lock(lock_path: str = "/var/run/pbs-runner.lock"):
+    """
+    Acquire an exclusive lock to ensure only one instance of pbs-runner runs at a time.
+    Uses fcntl file locking which is automatically released when the process exits.
+
+    Returns: file descriptor (stored globally) or exits with error code 3 if lock fails.
+    """
+    global _lockfile_fd
+
+    # Ensure parent directory exists
+    lock_file = Path(lock_path)
+    try:
+        lock_file.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"ERROR: Cannot create lock directory {lock_file.parent}: {e}", file=sys.stderr)
+        sys.exit(3)
+
+    try:
+        # Open lock file (create if doesn't exist)
+        _lockfile_fd = open(str(lock_file), 'w')
+
+        # Try to acquire exclusive lock (non-blocking)
+        fcntl.flock(_lockfile_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        # Write our PID to the file (for debugging purposes)
+        _lockfile_fd.write(f"{os.getpid()}\n")
+        _lockfile_fd.flush()
+
+        logging.debug("Acquired single-instance lock: %s", lock_path)
+
+    except BlockingIOError:
+        # Another instance is already running
+        print(f"ERROR: Another instance of pbs-runner is already running.", file=sys.stderr)
+        print(f"Lock file: {lock_path}", file=sys.stderr)
+        sys.exit(3)
+    except Exception as e:
+        print(f"ERROR: Failed to acquire lock {lock_path}: {e}", file=sys.stderr)
+        sys.exit(3)
 
 def sh(cmd, *, capture=False, env: Optional[Dict[str, str]] = None):
     """Run a command (list) with optional env overrides. Returns (rc, stdout, stderr)."""
@@ -332,6 +375,135 @@ def destroy_snapshot(ds: str, tag: str, recursive=False):
 def build_snapshot_tag(section_name: str) -> str:
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"pbsbkp-{socket.gethostname()}-{section_name}-{ts}"
+
+def cleanup_orphaned_snapshots(hostname: str, max_age_hours: int = 24, dry_run: bool = False) -> Tuple[int, int]:
+    """
+    Clean up orphaned pbsbkp snapshots older than max_age_hours.
+
+    This function identifies snapshots created by previous pbs-runner runs that were
+    not properly cleaned up due to crashes, kills, or system reboots.
+
+    Args:
+        hostname: Current hostname (snapshots are hostname-specific)
+        max_age_hours: Maximum age in hours before snapshot is considered orphaned
+        dry_run: If True, only log what would be deleted
+
+    Returns:
+        Tuple of (total_found, total_deleted)
+    """
+    if not zfs_available():
+        logging.debug("ZFS not available, skipping orphaned snapshot cleanup")
+        return 0, 0
+
+    # List all snapshots matching our pattern
+    rc, out, err = sh(["zfs", "list", "-t", "snapshot", "-H", "-o", "name,creation"], capture=True)
+    if rc != 0:
+        logging.warning("Failed to list ZFS snapshots for cleanup: %s", err.strip())
+        return 0, 0
+
+    prefix = f"pbsbkp-{hostname}-"
+    now = dt.datetime.now()
+    threshold = now - dt.timedelta(hours=max_age_hours)
+
+    total_found = 0
+    total_deleted = 0
+    total_kept_recent = 0
+    total_parse_failed = 0
+    oldest_kept_age = 0.0
+    newest_kept_age = float('inf')
+
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+
+        snapshot_name = parts[0].strip()
+        creation_str = parts[1].strip()
+
+        # Check if this is one of our pbsbkp snapshots
+        if "@" not in snapshot_name:
+            continue
+
+        dataset, tag = snapshot_name.split("@", 1)
+        if not tag.startswith(prefix):
+            continue
+
+        total_found += 1
+
+        # Parse timestamp from snapshot name: pbsbkp-{hostname}-{section}-{YYYYMMDD-HHMMSS}
+        # Example: pbsbkp-myserver-host-20251108-143022
+        try:
+            # Extract the timestamp portion (last part after last dash group)
+            # Format: YYYYMMDD-HHMMSS
+            parts = tag.rsplit("-", 2)
+            if len(parts) >= 2:
+                date_part = parts[-2]  # YYYYMMDD
+                time_part = parts[-1]  # HHMMSS
+
+                # Parse the timestamp
+                timestamp_str = f"{date_part}-{time_part}"
+                snapshot_time = dt.datetime.strptime(timestamp_str, "%Y%m%d-%H%M%S")
+
+                # Check if snapshot is older than threshold
+                if snapshot_time < threshold:
+                    age_hours = (now - snapshot_time).total_seconds() / 3600
+                    if dry_run:
+                        logging.info("[DRY RUN] would delete orphaned snapshot %s (age: %.1f hours)",
+                                   snapshot_name, age_hours)
+                        total_deleted += 1
+                    else:
+                        logging.info("Deleting orphaned snapshot %s (age: %.1f hours)",
+                                   snapshot_name, age_hours)
+                        # Determine if snapshot is recursive (has child snapshots)
+                        # For safety, we'll use non-recursive delete and let ZFS handle dependencies
+                        rc_del, _, err_del = sh(["zfs", "destroy", snapshot_name], capture=True)
+                        if rc_del == 0:
+                            total_deleted += 1
+                        else:
+                            logging.warning("Failed to delete orphaned snapshot %s: %s",
+                                          snapshot_name, err_del.strip())
+                else:
+                    age_hours = (now - snapshot_time).total_seconds() / 3600
+                    total_kept_recent += 1
+                    oldest_kept_age = max(oldest_kept_age, age_hours)
+                    newest_kept_age = min(newest_kept_age, age_hours)
+                    logging.debug("Snapshot %s is recent (age: %.1f hours), keeping",
+                                snapshot_name, age_hours)
+            else:
+                total_parse_failed += 1
+                logging.warning("Could not parse timestamp from snapshot name: %s", tag)
+
+        except ValueError as e:
+            total_parse_failed += 1
+            logging.warning("Could not parse timestamp from snapshot %s: %s", snapshot_name, e)
+            continue
+
+    # Provide detailed summary
+    if total_found > 0:
+        kept_msg = ""
+        if total_kept_recent > 0:
+            if newest_kept_age == float('inf'):
+                kept_msg = f", kept {total_kept_recent} recent (all under {max_age_hours}h threshold)"
+            else:
+                kept_msg = f", kept {total_kept_recent} recent (age range: {newest_kept_age:.1f}h - {oldest_kept_age:.1f}h, threshold: {max_age_hours}h)"
+
+        parse_msg = ""
+        if total_parse_failed > 0:
+            parse_msg = f", {total_parse_failed} parse failures"
+
+        if dry_run:
+            logging.info("Orphaned snapshot cleanup [DRY RUN]: found %d pbsbkp snapshots, would delete %d%s%s",
+                       total_found, total_deleted, kept_msg, parse_msg)
+        else:
+            logging.info("Orphaned snapshot cleanup: found %d pbsbkp snapshots, deleted %d%s%s",
+                       total_found, total_deleted, kept_msg, parse_msg)
+    else:
+        logging.debug("No orphaned pbsbkp snapshots found")
+
+    return total_found, total_deleted
 
 # =========================
 # Union (bind) helpers
@@ -1188,6 +1360,15 @@ def main():
 
     global_defaults = cfg.get("defaults", {}) or {}
     setup_logging(global_defaults)
+
+    # Acquire single-instance lock to prevent concurrent runs
+    # Lock is automatically released when process exits
+    acquire_single_instance_lock()
+
+    # Clean up orphaned snapshots from previous failed runs
+    hostname = socket.gethostname()
+    cleanup_threshold = global_defaults.get("orphaned_snapshot_max_age_hours", 24)
+    cleanup_orphaned_snapshots(hostname, max_age_hours=cleanup_threshold, dry_run=args.dry_run)
 
     notifications = cfg.get("notifications", {}) or {}
     hc_url = (notifications.get("healthcheck_url") or "").strip()

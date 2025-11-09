@@ -29,6 +29,16 @@ defaults:
   fallback_to_live: true          # if snapshotting fails/unavailable, back up live paths (warn)
   skip_hidden_subfolders: true    # ignore subfolders that start with '.' when splitting
 
+  # Orphaned snapshot cleanup:
+  # Automatically cleans up snapshots from previous failed runs (crashes, kills, reboots)
+  # Runs at script startup before backups begin
+  orphaned_snapshot_max_age_hours: 24   # delete snapshots older than this (hours)
+                                        # Adjust based on backup frequency:
+                                        # - 24h (default): daily backups, cleanup after 1 day
+                                        # - 48h: bi-daily backups or extra safety margin
+                                        # - 6h: hourly backups, faster cleanup
+                                        # - 1h: aggressive cleanup for testing
+
   # Grouping of backups into PBS snapshots:
   # - bundle        : items sharing (repo, ns, backup-id) are bundled into one command
   # - per-app-id    : each item uses its own --backup-id (from backup_id_template)

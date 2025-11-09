@@ -53,6 +53,7 @@ Applies to all sections/folders unless overridden.
 | `split_subfolders` | bool | `false` | If `true`, each immediate subfolder becomes its own item. |
 | `fallback_to_live` | bool | `true` | If snapshotting fails/unavailable, back up from live paths and warn. |
 | `skip_hidden_subfolders` | bool | `true` | When splitting, ignore subfolders starting with `.`. |
+| `orphaned_snapshot_max_age_hours` | int | `24` | Automatically cleanup orphaned snapshots older than this (hours). Runs at startup to remove snapshots from previous failed runs (crashes, kills, reboots). Adjust based on backup frequency (e.g., 6h for hourly, 48h for extra safety). |
 | `backup_grouping` | enum | `"bundle"` | How to group pxars into PBS snapshots: `"bundle"`, `"per-app-id"`, `"per-namespace"`. |
 | `backup_id_template` | str | `"{host}-{name}"` | Template used when `backup_grouping="per-app-id"`. Tokens: `{host}`, `{name}`, `{section}`, `{YYYY}`, `{MM}`, `{DD}`. |
 | `namespace` | str | `""` | Base namespace for items (empty = root). |
@@ -77,6 +78,51 @@ directory as **one pxar**, adding `--include-dev` for each child bind.
 
 > If `union_mode: off`, backing up the parent dataset snapshot will not include child dataset contents (ZFS behavior). Use `split_subfolders: true`
 > or list each child dataset as its own folder entry.
+
+---
+
+## Operational Safety Features
+
+### Single-Instance Lock
+
+pbs-runner automatically prevents concurrent execution using file-based locking (`/var/run/pbs-runner.lock`).
+
+- **Behavior**: If another instance is already running, the script exits immediately with error code 3.
+- **Lock cleanup**: Automatic — lock is released when the process exits (even on crashes).
+- **Error message**: `ERROR: Another instance of pbs-runner is already running.`
+
+This prevents race conditions with snapshot creation/deletion and mount operations.
+
+### Orphaned Snapshot Cleanup
+
+Automatically cleans up snapshots from previous failed runs at script startup.
+
+**How it works:**
+1. Lists all ZFS snapshots matching `pbsbkp-{hostname}-*` pattern
+2. Parses timestamp from snapshot name (format: `pbsbkp-host-section-YYYYMMDD-HHMMSS`)
+3. Deletes snapshots older than `orphaned_snapshot_max_age_hours` threshold
+4. Logs detailed statistics about what was found/deleted/kept
+
+**Example log output:**
+```
+Orphaned snapshot cleanup: found 12 pbsbkp snapshots, deleted 0, kept 12 recent (age range: 0.5h - 18.3h, threshold: 24h)
+```
+
+**Configuration:**
+```yaml
+defaults:
+  orphaned_snapshot_max_age_hours: 24  # Adjust based on backup frequency
+```
+
+**Common scenarios:**
+- Crashes or kills (SIGKILL, system reboot, power loss)
+- Script interruption before cleanup runs
+- Historical orphans from previous bugs
+
+**Benefits:**
+- Self-healing: no manual intervention needed
+- Space savings: orphaned snapshots don't accumulate
+- Visibility: all actions logged with age information
 
 ---
 
