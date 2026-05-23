@@ -721,6 +721,83 @@ def discover_vms_from_libvirt(auto_discover_cfg: dict, section_defaults: dict) -
 
     return vm_entries
 
+def apply_manual_vm_overrides(discovered: List[dict], manual_cfg: List[dict], auto_discover_cfg: dict) -> List[dict]:
+    """
+    Merge manual_vms entries onto auto-discovered VM entries.
+
+    For each manual_vms entry:
+      - If the VM was auto-discovered: apply overrides onto it in-place.
+      - If the VM was NOT auto-discovered: load its XML and add it as a new entry.
+
+    Supported override keys per entry:
+      vm_name         (required) VM name matching the libvirt domain name
+      exclude_disks   list of target_dev names to skip (e.g. ["vdb"])
+      repositories    replace the repo list for this VM
+      namespace       replace the namespace (template tokens supported)
+      snapshot        override snapshot setting
+      fallback_to_live override fallback setting
+      check_vm_state  override state-check setting
+      warn_if_running override running-warn setting
+    """
+    if not manual_cfg:
+        return discovered
+
+    config_path = auto_discover_cfg.get('config_path', '/etc/libvirt/qemu')
+    default_repos = auto_discover_cfg.get('repositories', [])
+    default_ns = auto_discover_cfg.get('namespace')
+
+    discovered_by_name = {e['name']: e for e in discovered}
+
+    for override in manual_cfg:
+        vm_name = override.get('vm_name')
+        if not vm_name:
+            logging.warning("manual_vms entry missing 'vm_name', skipping: %s", override)
+            continue
+
+        if vm_name in discovered_by_name:
+            entry = discovered_by_name[vm_name]
+        else:
+            xml_file = Path(config_path) / f"{vm_name}.xml"
+            if not xml_file.exists():
+                logging.warning("manual_vms: VM '%s' not in auto_discover and XML not found at %s", vm_name, xml_file)
+                continue
+            vm_data = parse_vm_xml(xml_file)
+            if not vm_data:
+                logging.warning("manual_vms: Failed to parse XML for '%s'", vm_name)
+                continue
+            vm_data['repositories'] = list(default_repos)
+            vm_data['namespace'] = default_ns
+            vm_data['overrides'] = {}
+            discovered_by_name[vm_name] = vm_data
+            discovered.append(vm_data)
+            entry = vm_data
+            logging.info("manual_vms: Added VM '%s' (not in auto_discover)", vm_name)
+
+        if 'overrides' not in entry:
+            entry['overrides'] = {}
+
+        exclude_disks = override.get('exclude_disks', [])
+        if exclude_disks:
+            before = len(entry['disks'])
+            entry['disks'] = [d for d in entry['disks'] if d['target_dev'] not in exclude_disks]
+            skipped = before - len(entry['disks'])
+            if skipped:
+                logging.info("manual_vms: VM '%s' excluding %d disk(s) matching %s", vm_name, skipped, exclude_disks)
+
+        if 'repositories' in override:
+            entry['repositories'] = override['repositories']
+            logging.info("manual_vms: VM '%s' using repositories: %s", vm_name, override['repositories'])
+
+        if 'namespace' in override:
+            entry['namespace'] = override['namespace']
+
+        for key in ('snapshot', 'fallback_to_live', 'check_vm_state', 'warn_if_running'):
+            if key in override:
+                entry['overrides'][key] = override[key]
+                logging.info("manual_vms: VM '%s' override %s=%s", vm_name, key, override[key])
+
+    return discovered
+
 # =========================
 # Planning model
 # =========================
@@ -1076,6 +1153,7 @@ def plan_vm_backup(vm_entry: dict, section_defaults: dict, global_defaults: dict
     """
     eff = dict(global_defaults or {})
     eff.update(section_defaults or {})
+    eff.update(vm_entry.get('overrides', {}))  # per-VM overrides win over section defaults
 
     snapshot = bool(eff.get("snapshot", False))
     fallback = bool(eff.get("fallback_to_live", True))
@@ -1471,7 +1549,10 @@ def main():
                     discovered_vms = discover_vms_from_libvirt(auto_discover_cfg, section_defaults)
                     logging.info("Auto-discovered %d VM(s)", len(discovered_vms))
 
-                # TODO: Add manual_vms support in future
+                # Merge manual_vms overrides (and add any non-auto-discovered VMs)
+                if manual_vms:
+                    discovered_vms = apply_manual_vm_overrides(discovered_vms, manual_vms, auto_discover_cfg)
+                    logging.info("After manual_vms processing: %d VM(s) total", len(discovered_vms))
 
                 # Plan backup for each discovered VM
                 for vm_entry in discovered_vms:
