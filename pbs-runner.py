@@ -1393,6 +1393,49 @@ def build_pbc_command(entries: List[PxarEntry], ns: Optional[str], backup_id: st
     args.extend(extra_args)
     return args
 
+def ensure_namespace(ns: str, pbc_binary: str, env: Dict[str, str], dry_run: bool) -> bool:
+    """
+    Ensure a PBS namespace and all its parents exist, creating any that are missing.
+    Returns True if all levels exist or were created, False if any creation failed.
+    """
+    if not ns:
+        return True
+
+    parts = [p for p in ns.split("/") if p]
+    levels = ["/".join(parts[:i + 1]) for i in range(len(parts))]
+
+    existing: set = set()
+    rc, out, _ = sh([pbc_binary, "namespace", "list", "--output-format=json"], capture=True, env=env)
+    if rc == 0:
+        try:
+            for item in json.loads(out):
+                val = item.get("ns") or item.get("name") or ""
+                if val:
+                    existing.add(val.strip("/"))
+        except Exception:
+            logging.debug("Could not parse namespace list output; will attempt creation anyway")
+    else:
+        logging.debug("namespace list failed; will attempt creation anyway")
+
+    for level in levels:
+        if level in existing:
+            continue
+        if dry_run:
+            logging.info("DRY RUN - would create namespace: %s", level)
+            continue
+        logging.info("Creating namespace: %s", level)
+        rc, _, err = sh([pbc_binary, "namespace", "create", "--ns", level], capture=True, env=env)
+        if rc != 0:
+            if "already exist" in err.lower():
+                logging.debug("Namespace '%s' already exists", level)
+            else:
+                logging.error("Failed to create namespace '%s': %s", level, err.strip())
+                return False
+        else:
+            logging.info("Created namespace: %s", level)
+
+    return True
+
 def run_command(args: List[str], env: Dict[str, str]) -> int:
     import shlex
     safe_env_log = {
@@ -1616,6 +1659,11 @@ def main():
                 env = repo_env_from_cfg(repositories_cfg, repo_alias)
                 if env is None:
                     logging.error("Skipping group (repo-alias=%s) due to missing/invalid repository config.", repo_alias)
+                    type_exit_code = type_exit_code or 2
+                    continue
+
+                if ns and not ensure_namespace(ns, pbc_binary, env, dry_run=args.dry_run):
+                    logging.error("Cannot ensure namespace '%s' exists, skipping group (repo=%s bid=%s).", ns, repo_alias, bid)
                     type_exit_code = type_exit_code or 2
                     continue
 
