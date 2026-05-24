@@ -46,6 +46,10 @@ defaults:
   backup_grouping: "bundle"
   backup_id_template: "{host}-{name}"     # tokens: {host}, {name}, {section}, {YYYY}, {MM}, {DD}
   namespace: ""                           # base namespace for items ('' => root)
+                                          # WARNING: namespaces must be pre-created in PBS before use.
+                                          # PBS does not auto-create them. Nested namespaces (e.g. "a/b")
+                                          # require each parent to exist first ("a", then "a/b").
+                                          # Create via PBS web UI or: proxmox-backup-manager namespace create <datastore> --ns <name>
   namespace_template: "{host}/{name}"       # used when backup_grouping=per-namespace
 
   # Union mode (bind-mounted unified snapshot view)
@@ -152,9 +156,13 @@ vm:
       - my_repo                       # PBS repository to backup to
 
     # Optional: namespace for VM backups (supports template variables)
+    # WARNING: namespaces must be pre-created in PBS before use — pbs-runner will not create them.
+    # For nested namespaces (e.g. "{host}/vms"), create each level first:
+    #   proxmox-backup-manager namespace create <datastore> --ns <hostname>
+    #   proxmox-backup-manager namespace create <datastore> --ns <hostname>/vms
     # Examples:
     #   namespace: "vms"              # All VMs in /vms namespace
-    #   namespace: "{host}/vms"       # /hostname/vms namespace
+    #   namespace: "{host}/vms"       # /hostname/vms namespace (recommended for multi-host setups)
     #   namespace: "vms/{vm}"         # /vms/vm-name namespace
     # namespace: "vms"
 
@@ -201,15 +209,25 @@ vm:
   #     vm-config.pxar    (VM XML config)
 
   # -------------------------
-  # Manual VM configuration (future feature - not yet implemented)
+  # Per-VM overrides via manual_vms
   # -------------------------
+  # manual_vms entries are merged on top of auto-discovered VMs.
+  # Use this to customise specific VMs without disabling auto-discovery.
+  # If a vm_name is not found by auto_discover, its XML is loaded directly
+  # from auto_discover.config_path (so it still needs a libvirt XML file).
+  #
   # manual_vms:
-  #   - name: special-vm
-  #     vm_name: "special-vm"           # Name in virsh
-  #     path: /custom/vm/location
-  #     config_file: /custom/vm.xml
-  #     repositories:
-  #       - my_repo
+  #   - vm_name: "my-big-vm"           # REQUIRED: must match the libvirt domain name
+  #     exclude_disks: ["vdb"]         # skip these disks (by target device name)
+  #
+  #   - vm_name: "windows-vm"
+  #     exclude_disks: ["vdb", "vdc"]  # skip multiple disks
+  #     repositories: [slow_repo]      # send this VM to a different PBS repo
+  #     namespace: "vms/windows"       # different namespace (template tokens supported)
+  #     snapshot: false                # override snapshot setting for this VM only
+  #     fallback_to_live: false        # override fallback setting for this VM only
+  #     check_vm_state: false          # skip virsh state check for this VM
+  #     warn_if_running: false         # suppress running-VM warning for this VM
 
 # -------------------------
 # Section: ct (reserved for future)
