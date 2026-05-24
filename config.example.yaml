@@ -46,6 +46,10 @@ defaults:
   backup_grouping: "bundle"
   backup_id_template: "{host}-{name}"     # tokens: {host}, {name}, {section}, {YYYY}, {MM}, {DD}
   namespace: ""                           # base namespace for items ('' => root)
+                                          # WARNING: namespaces must be pre-created in PBS before use.
+                                          # PBS does not auto-create them. Nested namespaces (e.g. "a/b")
+                                          # require each parent to exist first ("a", then "a/b").
+                                          # Create via PBS web UI or: proxmox-backup-manager namespace create <datastore> --ns <name>
   namespace_template: "{host}/{name}"       # used when backup_grouping=per-namespace
 
   # Union mode (bind-mounted unified snapshot view)
@@ -152,9 +156,13 @@ vm:
       - my_repo                       # PBS repository to backup to
 
     # Optional: namespace for VM backups (supports template variables)
+    # WARNING: namespaces must be pre-created in PBS before use — pbs-runner will not create them.
+    # For nested namespaces (e.g. "{host}/vms"), create each level first:
+    #   proxmox-backup-manager namespace create <datastore> --ns <hostname>
+    #   proxmox-backup-manager namespace create <datastore> --ns <hostname>/vms
     # Examples:
     #   namespace: "vms"              # All VMs in /vms namespace
-    #   namespace: "{host}/vms"       # /hostname/vms namespace
+    #   namespace: "{host}/vms"       # /hostname/vms namespace (recommended for multi-host setups)
     #   namespace: "vms/{vm}"         # /vms/vm-name namespace
     # namespace: "vms"
 
