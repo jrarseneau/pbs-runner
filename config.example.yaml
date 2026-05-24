@@ -12,12 +12,15 @@ repositories:
   my_repo:
     repository: "user@pbs@pbs.example.com:datastore1"   # exported as PBS_REPOSITORY
     password:   "supersecret"                   # exported as PBS_PASSWORD
-    fingerprint: "aa:bb:cc:dd:ee:ff:..."        # exported as PBS_FINGERPRINT 
+    fingerprint: "aa:bb:cc:dd:ee:ff:..."        # exported as PBS_FINGERPRINT
+    # keyfile: "/etc/pbs/my_repo.key"           # optional: enable client-side encryption
+                                                # generate with: proxmox-backup-client key create /etc/pbs/my_repo.key
 
   # cloud:
   #   repository: "user@pbs@cloud-pbs.example.com:datastore"
   #   password:   "anothersecret"
   #   fingerprint: ""
+  #   keyfile: "/etc/pbs/cloud.key"
 
 # -------------------------
 # Global defaults (overridable at section and folder levels)

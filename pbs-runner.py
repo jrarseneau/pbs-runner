@@ -849,21 +849,25 @@ def masked(s: Optional[str]) -> str:
         return "*" * len(s)
     return s[:2] + "*" * (len(s) - 4) + s[-2:]
 
-def repo_env_from_cfg(repos_cfg: Dict[str, dict], alias: str) -> Optional[Dict[str, str]]:
+def repo_env_from_cfg(repos_cfg: Dict[str, dict], alias: str) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
     meta = repos_cfg.get(alias)
     if not meta:
         logging.error("Repository alias '%s' not found in config 'repositories' section.", alias)
-        return None
+        return None, None
     repo = (meta.get("repository") or "").strip()
     pwd = (meta.get("password") or "").strip()
     fp = (meta.get("fingerprint") or "").strip()
+    keyfile = (meta.get("keyfile") or "").strip() or None
     if not repo or not pwd:
         logging.error("Repository '%s' missing required fields (repository/password).", alias)
-        return None
+        return None, None
     env = {"PBS_REPOSITORY": repo, "PBS_PASSWORD": pwd}
     if fp:
         env["PBS_FINGERPRINT"] = fp
-    return env
+    if keyfile and not os.path.isfile(keyfile):
+        logging.warning("Repository '%s': keyfile '%s' not found — encryption disabled for this repo.", alias, keyfile)
+        keyfile = None
+    return env, keyfile
 
 # =========================
 # Core planner
@@ -1370,7 +1374,8 @@ def consolidate_and_dedupe(entries: List[PxarEntry]) -> List[PxarEntry]:
 # =========================
 
 def build_pbc_command(entries: List[PxarEntry], ns: Optional[str], backup_id: str,
-                      section_cfg, global_defaults, pbc_binary: str) -> List[str]:
+                      section_cfg, global_defaults, pbc_binary: str,
+                      keyfile: Optional[str] = None) -> List[str]:
     eff = {}
     eff.update(global_defaults or {})
     eff.update(section_cfg or {})
@@ -1394,6 +1399,8 @@ def build_pbc_command(entries: List[PxarEntry], ns: Optional[str], backup_id: st
         args.extend(["--backup-id", backup_id])
     if backup_type:
         args.extend(["--backup-type", backup_type])
+    if keyfile:
+        args.extend(["--keyfile", keyfile])
     args.extend(extra_args)
     return args
 
@@ -1668,7 +1675,7 @@ def main():
                 had_fallback = any(e.warned for e in entries)
                 print_plan_for_group(repo_alias, ns, bid, entries, current_type)
 
-                env = repo_env_from_cfg(repositories_cfg, repo_alias)
+                env, keyfile = repo_env_from_cfg(repositories_cfg, repo_alias)
                 if env is None:
                     logging.error("Skipping group (repo-alias=%s) due to missing/invalid repository config.", repo_alias)
                     type_exit_code = type_exit_code or 2
@@ -1679,7 +1686,7 @@ def main():
                     type_exit_code = type_exit_code or 2
                     continue
 
-                cmd = build_pbc_command(entries, ns, bid, section_defaults, global_defaults, pbc_binary)
+                cmd = build_pbc_command(entries, ns, bid, section_defaults, global_defaults, pbc_binary, keyfile=keyfile)
 
                 if args.dry_run:
                     import shlex
@@ -1687,6 +1694,8 @@ def main():
                                  env.get("PBS_REPOSITORY", ""),
                                  masked(env.get("PBS_PASSWORD")),
                                  env.get("PBS_FINGERPRINT", ""))
+                    if keyfile:
+                        logging.info("DRY RUN - would use keyfile: %s", keyfile)
                     logging.info("DRY RUN - would execute: %s", shlex.join(cmd))
                     continue
 
