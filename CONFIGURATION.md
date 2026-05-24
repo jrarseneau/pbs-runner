@@ -31,10 +31,19 @@ repositories:
     repository:  "user@pbs.example:datastore"  # PBS_REPOSITORY
     password:    "supersecret"                 # PBS_PASSWORD
     fingerprint: "aa:bb:cc:..."                # PBS_FINGERPRINT (optional but recommended)
+    keyfile:     "/etc/pbs/my_repo.key"        # optional: enables client-side encryption
 ```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `repository` | yes | PBS connection string (`user@pbs@host:datastore`). Exported as `PBS_REPOSITORY`. |
+| `password` | yes | PBS password. Exported as `PBS_PASSWORD`. |
+| `fingerprint` | no | TLS fingerprint for certificate pinning. Exported as `PBS_FINGERPRINT`. |
+| `keyfile` | no | Path to a PBC encryption key file. Passes `--keyfile` to every backup command for this repo. Generate with `proxmox-backup-client key create /path/to/key`. If the path does not exist at runtime, encryption is skipped with a warning. |
 
 - pbs-runner does **not** pass `--repository` on the CLI; it sets `PBS_*` env vars per command based on the alias(es) used by folders.
 - If a folder references an unknown alias, that group is skipped with an error.
+- `keyfile` is per-repo: different repositories can use different keys, or no encryption at all.
 
 > **Security**: Your config contains secrets. Restrict permissions:
 > ```bash
