@@ -914,6 +914,10 @@ def plan_for_folder(folder_cfg, section_defaults, global_defaults, *, dry_run=Fa
 
     host = socket.gethostname()
 
+    if base_namespace:
+        base_namespace = expand_template(base_namespace, name=make_label_from_path(path), section=section_name, host=host)
+        base_namespace = sanitize_namespace(base_namespace) or None
+
     # ======= Union mode (default) when snapshot & not split =======
     if snapshot and not split and union_mode != "off":
         zfs_ok = zfs_available()
@@ -1405,17 +1409,19 @@ def ensure_namespace(ns: str, pbc_binary: str, env: Dict[str, str], dry_run: boo
     levels = ["/".join(parts[:i + 1]) for i in range(len(parts))]
 
     existing: set = set()
-    rc, out, _ = sh([pbc_binary, "namespace", "list", "--output-format=json"], capture=True, env=env)
+    list_ok = False
+    rc, out, err_list = sh([pbc_binary, "namespace", "list", "--output-format=json"], capture=True, env=env)
     if rc == 0:
         try:
             for item in json.loads(out):
                 val = item.get("ns") or item.get("name") or ""
                 if val:
                     existing.add(val.strip("/"))
+            list_ok = True
         except Exception:
-            logging.debug("Could not parse namespace list output; will attempt creation anyway")
+            logging.warning("Could not parse namespace list output; will attempt creation for missing levels")
     else:
-        logging.debug("namespace list failed; will attempt creation anyway")
+        logging.warning("namespace list failed (rc=%d): %s; will attempt creation for missing levels", rc, err_list.strip())
 
     for level in levels:
         if level in existing:
@@ -1426,8 +1432,14 @@ def ensure_namespace(ns: str, pbc_binary: str, env: Dict[str, str], dry_run: boo
         logging.info("Creating namespace: %s", level)
         rc, _, err = sh([pbc_binary, "namespace", "create", "--ns", level], capture=True, env=env)
         if rc != 0:
-            if "already exist" in err.lower():
+            err_lower = err.lower()
+            if "already exist" in err_lower:
                 logging.debug("Namespace '%s' already exists", level)
+            elif not list_ok and ("permission" in err_lower or "unauthorized" in err_lower or "forbidden" in err_lower or "missing" in err_lower):
+                # Can't list namespaces and can't create — namespace likely pre-exists with
+                # a token that only has Datastore.Backup. Proceed and let the backup fail
+                # with a clearer error if the namespace truly doesn't exist.
+                logging.warning("Cannot create namespace '%s' (permission denied) and namespace list was unavailable; assuming it exists.", level)
             else:
                 logging.error("Failed to create namespace '%s': %s", level, err.strip())
                 return False
