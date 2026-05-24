@@ -914,6 +914,10 @@ def plan_for_folder(folder_cfg, section_defaults, global_defaults, *, dry_run=Fa
 
     host = socket.gethostname()
 
+    if base_namespace:
+        base_namespace = expand_template(base_namespace, name=make_label_from_path(path), section=section_name, host=host)
+        base_namespace = sanitize_namespace(base_namespace) or None
+
     # ======= Union mode (default) when snapshot & not split =======
     if snapshot and not split and union_mode != "off":
         zfs_ok = zfs_available()
